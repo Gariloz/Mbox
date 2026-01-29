@@ -1,10 +1,16 @@
 ; === Настройки ===
-DefaultInterval := 500   ; Интервал по умолчанию для новых групп (мс)
-KeyDelay := 0            ; Задержка между клавишами в последовательности (мс)
-UseSimulation := false   ; true = Send (симуляция), false = PostMessage (прямая отправка)
-ShowStatusGUI := true    ; Показывать окно статуса (true/false)
-StatusPosX := 0          ; X позиция окна статуса
-StatusPosY := 0          ; Y позиция окна статуса
+DefaultInterval := 500             ; Интервал по умолчанию для новых групп (мс)
+KeyDelay := 0                      ; Задержка между клавишами в последовательности (мс)
+UseSimulation := false             ; true = Send (симуляция), false = PostMessage (прямая отправка)
+ShowStatusGUI := true              ; Показывать окно статуса (true/false)
+StatusPosX := 0                    ; X позиция окна статуса
+StatusPosY := 0                    ; Y позиция окна статуса
+IndicatorEnabled := true           ; Показывать точку-индикатор (true/false)
+IndicatorBlink := false            ; Мигать (true/false). Если false: просто зелёный/красный
+IndicatorSize := 10                ; Размер точки (px)
+IndicatorPosX := 0                 ; X позиция точки
+IndicatorPosY := 0                 ; Y позиция точки
+IndicatorBlinkInterval := 1000     ; Интервал мигания (мс)
 
 ; === Горячие клавиши ===
 StartStopKey := "NumpadEnter"      ; Клавиша запуска и остановки 
@@ -24,19 +30,32 @@ Toggle := False
 Groups := []
 CurrentGroup := 1
 TotalGroups := 0
+IndicatorBlinkState := 0
+IndicatorDotHwnd := 0
 
 ; === Динамические горячие клавиши ===
-GoSub, ChooseKeys
 Hotkey, % "$" . StartStopKey, ToggleAction
 Hotkey, % "$" . ChangeKeysKey, RechooseKeys
 Hotkey, % "$" . ToggleGUIKey, ToggleStatusGUI
 Hotkey, % ExitKey, ExitApp
 
+InitIndicator()
+
+SetMainHotkeys("Off")
+GoSub, ChooseKeys
 Return
+
+SetMainHotkeys(state) {
+    Global StartStopKey, ChangeKeysKey, ToggleGUIKey
+    Hotkey, % "$" . StartStopKey, ToggleAction, %state%
+    Hotkey, % "$" . ChangeKeysKey, RechooseKeys, %state%
+    Hotkey, % "$" . ToggleGUIKey, ToggleStatusGUI, %state%
+}
 
 ; === Выбор клавиш ===
 ChooseKeys:
     IsChoosingKeys := True
+    SetMainHotkeys("Off")
     Gui, Destroy
 	Gui, Font, s10
     titleText := "Group " . CurrentGroup . " - Click on the buttons you want the script to press."
@@ -92,6 +111,7 @@ SaveCurrentGroup() {
 ReEnterPID:
     TargetPIDArray := [], TargetProcessArray := [], TargetHwndArray := []
     TotalProcesses := 0
+    SetMainHotkeys("Off")
     promptText := "Enter PID or process name.`n`n"
     promptText .= "Example.`n"
 	promptText .= "PID:[1234 5678][1234.5678].`n"
@@ -165,6 +185,8 @@ ReEnterPID:
     Gui, Add, Text, vStatus, %fullStatus%
     if (ShowStatusGUI)
         Gui, Show, x%StatusPosX% y%StatusPosY% NoActivate AutoSize, Multi-PID Control
+    InitIndicator()
+    SetMainHotkeys("On")
 Return
 
 ; === Обновление статуса ===
@@ -240,10 +262,74 @@ UpdateStatus() {
     GuiControl,, Status, % BuildStatusText(Toggle ? "ACTIVE" : "OFF")
 }
 
+InitIndicator() {
+    Global IndicatorEnabled, IndicatorPosX, IndicatorPosY, IndicatorSize
+    Global IndicatorBlinkState, IndicatorDotHwnd
+
+    if (!IndicatorEnabled) {
+        Gui, Indicator:Destroy
+        SetTimer, IndicatorBlinkTimer, Off
+        return
+    }
+
+    Gui, Indicator:Destroy
+    Gui, Indicator:+AlwaysOnTop -Caption +ToolWindow +E0x20 +LastFound
+    Gui, Indicator:Margin, 0, 0
+    Gui, Indicator:Color, 000000
+    Gui, Indicator:Add, Progress, hwndIndicatorDotHwnd w%IndicatorSize% h%IndicatorSize% cRed Background000000 Range0-100, 100
+    Gui, Indicator:Show, x%IndicatorPosX% y%IndicatorPosY% NoActivate
+    IndicatorBlinkState := 0
+    UpdateIndicator()
+}
+
+UpdateIndicator() {
+    Global Toggle, IndicatorEnabled, IndicatorBlink, IndicatorBlinkInterval
+    Global IndicatorBlinkState, IndicatorDotHwnd
+
+    if (!IndicatorEnabled) {
+        SetTimer, IndicatorBlinkTimer, Off
+        return
+    }
+
+    if (IndicatorBlink) {
+        IndicatorBlinkState := 1
+        color := Toggle ? "Green" : "Red"
+        GuiControl, Indicator:+c%color%, %IndicatorDotHwnd%
+        SetTimer, IndicatorBlinkTimer, %IndicatorBlinkInterval%
+    } else {
+        SetTimer, IndicatorBlinkTimer, Off
+        IndicatorBlinkState := 0
+        color := Toggle ? "Green" : "Red"
+        GuiControl, Indicator:+c%color%, %IndicatorDotHwnd%
+    }
+}
+
+IndicatorBlinkTimer:
+    Global Toggle, IndicatorEnabled, IndicatorBlink
+    Global IndicatorBlinkState, IndicatorDotHwnd
+    if (!IndicatorEnabled || !IndicatorBlink) {
+        SetTimer, IndicatorBlinkTimer, Off
+        IndicatorBlinkState := 0
+        GuiControl, Indicator:+cRed, %IndicatorDotHwnd%
+        return
+    }
+    IndicatorBlinkState := !IndicatorBlinkState
+    if (Toggle) {
+        color := IndicatorBlinkState ? "Green" : "0A2A0A"
+    } else {
+        color := IndicatorBlinkState ? "Red" : "2A0A0A"
+    }
+    GuiControl, Indicator:+c%color%, %IndicatorDotHwnd%
+Return
+
 ; === Подпрограмма: запуск/остановка ===
 ToggleAction:
+    if (IsChoosingKeys || TotalProcesses = 0 || TotalGroups = 0) {
+        Return
+    }
     Toggle := !Toggle
     UpdateStatus()
+    UpdateIndicator()
     Loop % TotalGroups {
         If (Toggle) {
             SendGroupKeys(A_Index)
@@ -266,6 +352,8 @@ RechooseKeys:
     KeysArray := ""
     Toggle := False
     UpdateStatus()
+    UpdateIndicator()
+    SetMainHotkeys("Off")
     GoSub, ChooseKeys
 Return
 
