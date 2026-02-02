@@ -52,6 +52,29 @@ SetMainHotkeys(state) {
     Hotkey, % "$" . ToggleGUIKey, ToggleStatusGUI, %state%
 }
 
+; === Захват кликов мыши в окне выбора клавиш ===
+#If (IsChoosingKeys && WinActive("Key Selection"))
+~LButton::
+    CaptureMouseButtonToken("{LButton}")
+Return
+~RButton::
+    CaptureMouseButtonToken("{RButton}")
+Return
+#If
+
+CaptureMouseButtonToken(token) {
+    Global KeysArray, IsChoosingKeys
+    if (!IsChoosingKeys)
+        return
+    MouseGetPos, , , , ctrl, 1
+    if (RegExMatch(ctrl, "i)^Button\d+$"))
+        return
+    if (ctrl = "Edit2")
+        return
+    KeysArray .= (KeysArray ? " " : "") . token
+    GuiControl,, KeyList, %KeysArray%
+}
+
 ; === Выбор клавиш ===
 ChooseKeys:
     IsChoosingKeys := True
@@ -396,6 +419,32 @@ SendGroupKeys(groupIndex) {
             If (!Toggle)
                 Return
             currentKey := keysArray[A_Index]
+            If (RegExMatch(currentKey, "i)^\{(LButton|LClick|Click)\}$"))
+            {
+                MouseGetPos, mX, mY, hWndUnderCursor
+                Loop %TotalProcesses%
+                {
+                    hWndTarget := TargetHwndArray[A_Index]
+                    if (hWndUnderCursor != hWndTarget)
+                        Continue
+                    SendLeftClickAtCursor(hWndTarget, True)
+                }
+                Sleep, %KeyDelay%
+                Continue
+            }
+            If (RegExMatch(currentKey, "i)^\{(RButton|RClick)\}$"))
+            {
+                MouseGetPos, mX, mY, hWndUnderCursor
+                Loop %TotalProcesses%
+                {
+                    hWndTarget := TargetHwndArray[A_Index]
+                    if (hWndUnderCursor != hWndTarget)
+                        Continue
+                    SendRightClickAtCursor(hWndTarget, True)
+                }
+                Sleep, %KeyDelay%
+                Continue
+            }
             If (RegExMatch(currentKey, "i)^\{Space\}$"))
             {
                 Loop %TotalProcesses%
@@ -466,6 +515,32 @@ SendGroupKeys(groupIndex) {
         If (!Toggle)
             Return
         currentKey := keysArray[A_Index]
+        If (RegExMatch(currentKey, "i)^\{(LButton|LClick|Click)\}$"))
+        {
+            MouseGetPos, mX, mY, hWndUnderCursor
+            Loop %TotalProcesses%
+            {
+                hWndTarget := TargetHwndArray[A_Index]
+                if (hWndUnderCursor != hWndTarget)
+                    Continue
+                SendLeftClickAtCursor(hWndTarget, False)
+            }
+            Sleep, %KeyDelay%
+            Continue
+        }
+        If (RegExMatch(currentKey, "i)^\{(RButton|RClick)\}$"))
+        {
+            MouseGetPos, mX, mY, hWndUnderCursor
+            Loop %TotalProcesses%
+            {
+                hWndTarget := TargetHwndArray[A_Index]
+                if (hWndUnderCursor != hWndTarget)
+                    Continue
+                SendRightClickAtCursor(hWndTarget, False)
+            }
+            Sleep, %KeyDelay%
+            Continue
+        }
         If (RegExMatch(currentKey, "i)^\{Space\}$"))
         {
             Loop %TotalProcesses%
@@ -637,6 +712,44 @@ ParseKeys(keysString) {
         }
     }
     Return keysArray
+}
+
+; === Клик ЛКМ в текущей позиции курсора (для выбранного hWnd) ===
+SendLeftClickAtCursor(hWndTarget, useSimulation := False) {
+    MouseGetPos, sX, sY
+    VarSetCapacity(pt, 8, 0)
+    NumPut(sX, pt, 0, "Int")
+    NumPut(sY, pt, 4, "Int")
+    DllCall("ScreenToClient", "Ptr", hWndTarget, "Ptr", &pt)
+    cX := NumGet(pt, 0, "Int")
+    cY := NumGet(pt, 4, "Int")
+    if (useSimulation) {
+        ControlClick, x%cX% y%cY%, ahk_id %hWndTarget%,, Left, 1, NA
+        return
+    }
+    lParam := ((cY & 0xFFFF) << 16) | (cX & 0xFFFF)
+    DllCall("PostMessage", "Ptr", hWndTarget, "UInt", 0x200, "Ptr", 0, "Ptr", lParam) ; WM_MOUSEMOVE
+    DllCall("PostMessage", "Ptr", hWndTarget, "UInt", 0x201, "Ptr", 1, "Ptr", lParam) ; WM_LBUTTONDOWN (MK_LBUTTON)
+    DllCall("PostMessage", "Ptr", hWndTarget, "UInt", 0x202, "Ptr", 0, "Ptr", lParam) ; WM_LBUTTONUP
+}
+
+; === ПКМ клик в текущей позиции курсора (для выбранного hWnd) ===
+SendRightClickAtCursor(hWndTarget, useSimulation := False) {
+    MouseGetPos, sX, sY
+    VarSetCapacity(pt, 8, 0)
+    NumPut(sX, pt, 0, "Int")
+    NumPut(sY, pt, 4, "Int")
+    DllCall("ScreenToClient", "Ptr", hWndTarget, "Ptr", &pt)
+    cX := NumGet(pt, 0, "Int")
+    cY := NumGet(pt, 4, "Int")
+    if (useSimulation) {
+        ControlClick, x%cX% y%cY%, ahk_id %hWndTarget%,, Right, 1, NA
+        return
+    }
+    lParam := ((cY & 0xFFFF) << 16) | (cX & 0xFFFF)
+    DllCall("PostMessage", "Ptr", hWndTarget, "UInt", 0x200, "Ptr", 0, "Ptr", lParam) ; WM_MOUSEMOVE
+    DllCall("PostMessage", "Ptr", hWndTarget, "UInt", 0x204, "Ptr", 2, "Ptr", lParam) ; WM_RBUTTONDOWN (MK_RBUTTON)
+    DllCall("PostMessage", "Ptr", hWndTarget, "UInt", 0x205, "Ptr", 0, "Ptr", lParam) ; WM_RBUTTONUP
 }
 
 ; === Получение VK-кода ===

@@ -14,7 +14,9 @@
 * **Real-time status GUI** - Visual status display showing active groups, intervals, and target processes
 * **Toggle GUI visibility** - Show/hide status window with hotkey (NumpadDot)
 * **Smart key parsing** - Handles keys with spaces and curly braces correctly (e.g., `{Space}`, `{Shift+A}`)
-* **No window activation required** - Works in background without stealing focus
+* **Mouse click tokens** - `{LButton}` / `{RButton}` (clicks at current cursor position, without activation)
+* **Indicator dot** - small always-on-top indicator (green/red, optional blinking)
+* **No window activation required** - Works in background without stealing focus (especially in Direct mode)
 
 ## Installation
 
@@ -62,6 +64,7 @@ StatusPosY := 0          ; Y position of status window
 * **Special keys**: `{Space}`, `{Enter}`, `{Tab}`, `{Esc}`, `{F1}`-`{F12}`
 * **Modifiers**: `{Shift+A}`, `{Ctrl+C}`, `{Alt+F4}`, `{Win+R}`
 * **Combinations**: `a {Space} b {Enter}` - sends "a", space, "b", enter
+* **Mouse clicks**: `{LButton}` / `{RButton}`
 * **Russian characters**: Works correctly in both modes (PostMessage recommended for old games)
 
 ## Sending Methods
@@ -94,6 +97,8 @@ StatusPosY := 0          ; Y position of status window
 * **Modifier key support** - Full Shift/Ctrl/Alt/Win combinations
 * **Space key fix** - Proper handling of space character in both modes
 * **No window activation** - Works in background (PostMessage mode)
+* **Mouse click tokens** - `{LButton}` / `{RButton}` support
+* **Indicator dot** - optional blinking green/red dot
 
 ## GitHub
 
