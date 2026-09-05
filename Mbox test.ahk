@@ -1,4 +1,4 @@
-; === Настройки ===
+﻿; === Настройки ===
 DefaultInterval := 500                  ; Интервал по умолчанию для новых групп (мс)
 KeyDelay := 0                           ; Задержка между клавишами в последовательности (мс)
 ; UseSimulation=true  — симуляция: клавиши и мышь — ControlSend / ControlClick на тот же HWND цели (TargetHwndArray).
@@ -41,6 +41,8 @@ Toggle := False
 Groups := []
 CurrentGroup := 1
 TotalGroups := 0
+QpcFreq := 0
+NextFire := []
 IndicatorBlinkState := 0
 IndicatorDotHwnd := 0
 GlobalBindsDisabled := False
@@ -53,6 +55,20 @@ ChoosePendingMouseToken := ""
 ChoosePendingMouseStart := 0
 ChooseHoldWaitUpMouse := 0
 HeldInfinite := []
+KeyListArmed := false   ; Захват клавиш активен (каретка мигает в списке клавиш)
+
+; === Система таймеров (до 3 штук) ===
+Timers0 := 0            ; Количество таймеров
+TimerEnabled := false   ; Запущены ли таймеры
+Timers1_Name := "", Timers1_Duration := 0, Timers1_Remaining := 0, Timers1_Active := false, Timers1_Start := 0
+Timers2_Name := "", Timers2_Duration := 0, Timers2_Remaining := 0, Timers2_Active := false, Timers2_Start := 0
+Timers3_Name := "", Timers3_Duration := 0, Timers3_Remaining := 0, Timers3_Active := false, Timers3_Start := 0
+
+; === Горячие клавиши таймеров ===
+Hotkey, % "$NumpadDiv", ToggleAllTimers, Off
+Hotkey, % "$Numpad7", ToggleTimer1, Off
+Hotkey, % "$Numpad8", ToggleTimer2, Off
+Hotkey, % "$Numpad9", ToggleTimer3, Off
 
 ; === Динамические горячие клавиши ===
 Hotkey, % "$" . StartStopKey, ToggleAction
@@ -75,10 +91,18 @@ SetMainHotkeys(state) {
     Hotkey, % "$" . ChangeKeysKey, RechooseKeys, %effectiveState%
     Hotkey, % "$" . ToggleGUIKey, ToggleStatusGUI, %effectiveState%
     Hotkey, % "$" . ToggleModeKey, ToggleSendMode, %effectiveState%
+    ; Таймерные клавиши — активны вместе с основными биндами
+    Hotkey, $NumpadDiv, ToggleAllTimers, %effectiveState%
+    Hotkey, $Numpad7, ToggleTimer1, %effectiveState%
+    Hotkey, $Numpad8, ToggleTimer2, %effectiveState%
+    Hotkey, $Numpad9, ToggleTimer3, %effectiveState%
 }
 
 ToggleBindLock:
     Global GlobalBindsDisabled, IsChoosingKeys, TotalProcesses, TotalGroups
+    ; При активном захвате клавиш — записать NumpadMult как бинд, не переключать LOCK
+    if (CaptureGlobalKeyAsBind(0x6A, "NumpadMult"))
+        Return
     GlobalBindsDisabled := !GlobalBindsDisabled
     if (GlobalBindsDisabled) {
         SetMainHotkeys("Off")
@@ -107,6 +131,8 @@ Return
 ; === Захват кликов мыши в окне выбора клавиш ===
 #If (IsChoosingKeys && WinActive("Key Selection"))
 ~LButton::
+    ; Сначала маршрутизация (вкл/выкл захвата), затем запись клика если захват активен
+    ChooseMouseClickRouting()
     MouseChooseButtonDown(1, "{LButton}")
 Return
 ~LButton Up::
@@ -140,15 +166,122 @@ ChooseFlushMousePendingIfAny() {
     ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
 }
 
+; --- Маршрутизация кликов ---
+ChooseMouseClickRouting() {
+    Global IsChoosingKeys, KeyListArmed, hKeyList, hGroupInterval
+    if (!IsChoosingKeys)
+        return
+    MouseGetPos, mx, my, , ctrlHwnd, 2
+    ; Клик по белому полю при АКТИВНОМ захвате → запись бинда происходит в ButtonDown
+    if (ctrlHwnd && ctrlHwnd = hKeyList && KeyListArmed)
+        return
+    ; Клик вне зоны захвата → гасим захват
+    if (KeyListArmed) {
+        KeyListArmed := false
+        UpdateCaptureState()
+    }
+    ; Снимаем каретку с интервала, если кликнули не по самому интервалу
+    if (!(ctrlHwnd && ctrlHwnd = hGroupInterval))
+        ControlFocus, Button1, Key Selection
+}
+
+; --- Обновление визуального индикатора захвата ---
+UpdateCaptureState() {
+    Global KeyListArmed, IsChoosingKeys
+    if (!IsChoosingKeys)
+        return
+    if (KeyListArmed) {
+        GuiControl, +cGreen, CaptureState
+        GuiControl,, CaptureState, [ ЗАХВАТ АКТИВЕН — нажимай клавиши и кнопки ]
+        ; Зелёный фон поля списка
+        GuiControl, +BackgroundLime, KeyList
+        ; Снимаем фокус с поля интервала, чтобы клавиши в него не печатались
+        ControlFocus, Button1, Key Selection
+    } else {
+        GuiControl, +cRed, CaptureState
+        GuiControl,, CaptureState, [ Клик по белому полю ниже, затем нажимай кнопки ]
+        ; Обычный белый фон
+        GuiControl, +BackgroundWhite, KeyList
+    }
+}
+
+; --- Глобальные хоткеи при активном захвате записываются как бинды ---
+; Возвращает true если клавиша перехвачена и записана (действие хоткея не выполняется)
+CaptureGlobalKeyAsBind(vk, keyName) {
+    Global IsChoosingKeys, KeyListArmed, KeysArray
+    static lastVk := 0, lastT := 0
+    if (!IsChoosingKeys || !KeyListArmed)
+        return false
+    ; Анти-автоповтор (клавиша удержана)
+    if (vk = lastVk && A_TickCount - lastT < 500)
+        return true
+    lastVk := vk, lastT := A_TickCount
+    ChooseFlushKeyboardPendingIfAny()
+    ChooseFlushMousePendingIfAny()
+    token := "{" keyName "}"
+    KeysArray .= (KeysArray ? " " : "") . token
+    GuiControl,, KeyList, %KeysArray%
+    SoundBeep, 600, 60
+    return true
+}
+
 MouseChooseButtonDown(btn, token) {
     Global IsChoosingKeys, ChoosePendingMouseBtn, ChoosePendingMouseToken, ChoosePendingMouseStart, ChooseHoldWaitUpMouse
+    Global KeyListArmed, hKeyList, hGroupInterval
     if (!IsChoosingKeys || !WinActive("Key Selection"))
         return
-    MouseGetPos, , , , ctrl, 1
-    if (RegExMatch(ctrl, "i)^Button\d+$"))
+    MouseGetPos, mx, my, , ctrlHwnd, 2
+    inKeyList := (ctrlHwnd && ctrlHwnd = hKeyList)
+    ; Клик по белому полю при выключенном захвате = ТОЛЬКО активация (не бинд)
+    if (inKeyList && !KeyListArmed) {
+        KeyListArmed := true
+        UpdateCaptureState()
         return
-    if (ctrl = "Edit2")
+    }
+    ; Клик по контролам GUI (интервал) — не бинд никогда
+    if (ctrlHwnd && ctrlHwnd = hGroupInterval)
         return
+    ; Клик по кнопкам — не бинд, кнопка сама сработает
+    MouseGetPos, , , , ctrlClass, 1
+    if (RegExMatch(ctrlClass, "i)^Button\d+$"))
+        return
+    ; Дальше записываем ТОЛЬКО при активном захвате
+    if (!KeyListArmed)
+        return
+    ; --- Здесь клик записывается как бинд ---
+    ; Учитываем зажатые модификаторы (Shift/Ctrl/Alt/Win) для мышиных биндов
+    mods := ""
+    if (GetKeyState("Shift", "P"))
+        mods .= "Shift+"
+    if (GetKeyState("Ctrl", "P"))
+        mods .= "Ctrl+"
+    if (GetKeyState("Alt", "P"))
+        mods .= "Alt+"
+    if (GetKeyState("LWin", "P") || GetKeyState("RWin", "P"))
+        mods .= "Win+"
+    ; Зажатые обычные клавиши (CapsLock, буквы, Esc и т.д.) тоже модификаторы
+    if (GetKeyState("CapsLock", "T"))
+        mods .= "CapsLock+"
+    static trackVk := [0x1B, 0x09, 0x08, 0x2E, 0x2D, 0x24, 0x23, 0x22, 0x21, 0x20]
+    Loop % trackVk.Length() {
+        tvk := trackVk[A_Index]
+        if (GetKeyState("vk" . VkToHex(tvk), "P")) {
+            kn := VkKeyName(tvk)
+            if (kn != "" && !InStr(mods, kn . "+"))
+                mods .= kn . "+"
+        }
+    }
+    ; Ожидающая отслеживаемая клавиша (ChoosePendingVk) — тоже модификатор
+    Global ChoosePendingVk, ChoosePendingToken
+    if (ChoosePendingVk && ChoosePendingToken != "") {
+        pendKey := TokenToHoldKeyspec(ChoosePendingToken)
+        pendKey := RegExReplace(pendKey, "^\{?", "")
+        pendKey := RegExReplace(pendKey, "\}?$", "")
+        if (pendKey != "" && !InStr(mods, pendKey . "+"))
+            mods .= pendKey . "+"
+    }
+    if (mods != "")
+        token := "{" . mods . SubStr(token, 2)  ; {Mod+LButton
     ChooseFlushKeyboardPendingIfAny()
     if (ChoosePendingMouseBtn && ChoosePendingMouseBtn != btn)
         ChooseFlushMousePendingIfAny()
@@ -178,7 +311,7 @@ MouseChooseButtonUp(btn) {
     elapsed := A_TickCount - ChoosePendingMouseStart
     GuiControlGet, hm,, GroupInterval
     if (hm = "")
-        holdMs := DefaultInterval
+        holdMs := 0
     else
         holdMs := hm + 0
     if (holdMs < 0)
@@ -195,18 +328,31 @@ MouseChooseButtonUp(btn) {
 ; === Выбор клавиш ===
 ChooseKeys:
     IsChoosingKeys := True
+    KeyListArmed := false
     SetMainHotkeys("Off")
     Gui, Destroy
     Gui, Font, s10
     titleText := "Group " . CurrentGroup . " - Click on the buttons you want the script to press."
     Gui, Add, Text, x10 y10 w380 Center, %titleText%
-    Gui, Add, Edit, x25 y35 vKeyList w350 r5 ReadOnly
-    Gui, Add, Text, x25 y135, Interval (ms):
-    Gui, Add, Edit, x105 y130 vGroupInterval w60, %DefaultInterval%
-    Gui, Add, Button, x25 y160 gConfirmKeys, Confirm Selection
+    ; Индикатор состояния захвата клавиш
+    Gui, Font, s9 cRed Bold
+    Gui, Add, Text, x25 y30 w350 vCaptureState Center, [ Клик по белому полю ниже, затем нажимай кнопки ]
+    Gui, Font, s10 cBlack
+    ; Рамка-подпись вокруг зоны захвата
+    Gui, Add, GroupBox, x15 y46 w370 h100, Клавиши для записи — КЛИКНИ СЮДА
+    ; Поле списка клавиш — Text (без каретки)
+    Gui, Add, Text, x25 y64 w350 h76 Border BackgroundWhite hwndhKeyList vKeyList,
+    Gui, Add, Text, x25 y152, Interval (ms):
+    Gui, Add, Edit, x105 y147 vGroupInterval w60 hwndhGroupInterval, %DefaultInterval%
+    Gui, Add, Button, x25 y175 gConfirmKeys hwndhConfirmBtn, Confirm Selection
     Gui, Add, Button, x+10 gClearKeys, Clear buttons
     Gui, Add, Button, x+10 gAddAnotherGroup, Add Another Group
-    Gui, Show, w400 h200, Key Selection
+    Gui, Add, Button, x25 y205 gAddTimerGui, Add Timer
+    timerInfo := BuildTimerListShort()
+    Gui, Add, Text, x120 y209 w260 vTimerInfoText, %timerInfo%
+    Gui, Show, w400 h240, Key Selection
+    ; Убираем фокус с поля интервала (чтобы клавиши не печатались в него)
+    ControlFocus, Button1, Key Selection
     OnMessage(0x112, "GuiClose")
     KeysArray := ""
     SetTimer, ChooseHoldDetectTimer, Off
@@ -217,6 +363,8 @@ ChooseKeys:
     ChooseHoldWaitUpMouse := 0
     OnMessage(0x100, "KeyDownMsg")
     OnMessage(0x101, "KeyUpMsg")
+    OnMessage(0x104, "KeyDownMsg")   ; WM_SYSKEYDOWN (Alt-комбинации, F10)
+    OnMessage(0x105, "KeyUpMsg")     ; WM_SYSKEYUP
 Return
 
 GuiClose:
@@ -225,6 +373,7 @@ Return
 
 ClearKeys:
     KeysArray := ""
+    KeyListArmed := false
     SetTimer, ChooseHoldDetectTimer, Off
     SetTimer, ChooseMouseHoldDetectTimer, Off
     ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
@@ -236,6 +385,7 @@ Return
 
 ConfirmKeys:
     IsChoosingKeys := False
+    KeyListArmed := false
     OnMessage(0x100, False), OnMessage(0x101, False)
     Gui, Submit, NoHide
     SetTimer, ChooseHoldDetectTimer, Off
@@ -249,6 +399,7 @@ Return
 
 AddAnotherGroup:
     IsChoosingKeys := False
+    KeyListArmed := false
     OnMessage(0x100, False), OnMessage(0x101, False)
     SetTimer, ChooseHoldDetectTimer, Off
     SetTimer, ChooseMouseHoldDetectTimer, Off
@@ -390,6 +541,7 @@ ReEnterPID:
         Gui, Show, x%StatusPosX% y%StatusPosY% NoActivate AutoSize, Multi-PID Control
     InitIndicator()
     SetMainHotkeys("On")
+    StartProcessMonitor()
 Return
 
 ; === Обновление статуса ===
@@ -461,6 +613,19 @@ BuildStatusText(statusMode) {
                 fullStatus .= "`n"
         }
     }
+    ; === Блок таймеров в статусе ===
+    timerLines := BuildTimerStatusLines()
+    if (timerLines != "") {
+        fullStatus .= "`n" . border . "`n"
+        Loop, Parse, timerLines, `n
+        {
+            tLine := A_LoopField
+            tPadding := ""
+            Loop % (maxLen - StrLen(tLine))
+                tPadding .= " "
+            fullStatus .= "| " tLine tPadding " |"
+        }
+    }
     Return fullStatus . "`n" . border
 }
 
@@ -528,6 +693,10 @@ UpdateStatus() {
     Global Toggle, ShowStatusGUI, GlobalBindsDisabled
     if (!ShowStatusGUI)
         Return
+    ; Защита: GUI статуса может не существовать (идёт выбор клавиш)
+    GuiControlGet, sbExist,, StatusBorder
+    if (sbExist = "")
+        Return
     if (GlobalBindsDisabled) {
         mode := Toggle ? "ACTIVE (LOCKED)" : "OFF (LOCKED)"
     } else {
@@ -542,6 +711,8 @@ UpdateStatus() {
     GuiControl, +c%innerColor%, Status
     GuiControl,, StatusBorder, %borderOnly%
     GuiControl,, Status, %innerStatusText%
+    ; Пересчитать размер окна под новый текст (уменьшение и увеличение)
+    Gui, Show, NoActivate AutoSize
 }
 
 InitIndicator() {
@@ -624,24 +795,71 @@ IndicatorBlinkTimer:
     GuiControl, Indicator:+c%innerColor%, %IndicatorDotHwnd%
 Return
 
-; === Подпрограмма: точная отправка с задержкой ===
+; Возвращает текущее время в МИКРОСЕКУНДАХ (высокое разрешение)
+QpcNowUsec() {
+    Global QpcFreq
+    static freq := 0
+    if (!freq) {
+        DllCall("kernel32\QueryPerformanceFrequency", "Int64*", freq)
+        if (!freq)
+            freq := 1000000
+    }
+    DllCall("kernel32\QueryPerformanceCounter", "Int64*", qpc)
+    return (qpc * 1000000) // freq
+}
+
+; === Подпрограмма: точный движок отправки (абсолютное расписание, QPC, без дрейфа) ===
 ToggleDeferredSendGroups:
     SetTimer, ToggleDeferredSendGroups, Off
-    Global Toggle, TotalGroups
+    Global Toggle, TotalGroups, NextFire
     if (!Toggle)
         Return
-    ; Используем точный таймер через A_TickCount
-    currentTick := A_TickCount
-    Loop % TotalGroups {
-        If (Toggle)
-            SendGroupKeys(A_Index)
-    }
-    ; Перезапускаем таймер с точным интервалом
-    if (Toggle) {
-        nextDelay := Groups[1].interval - (A_TickCount - currentTick)
-        if (nextDelay < 1)
-            nextDelay := 1
-        SetTimer, ToggleDeferredSendGroups, % -nextDelay
+    Loop {
+        if (!Toggle)
+            Return
+        nowU := QpcNowUsec()
+        ; Отправляем все группы, чей срок наступил
+        Loop % TotalGroups {
+            idx := A_Index
+            if (nowU >= NextFire[idx]) {
+                SendGroupKeys(idx)
+                ivlU := Groups[idx].interval * 1000  ; мс -> мкс
+                ; Абсолютное расписание: следующий тик = старый срок + интервал (дрейф не копится)
+                if (NextFire[idx] > 0 && nowU - NextFire[idx] < ivlU)
+                    NextFire[idx] := NextFire[idx] + ivlU
+                else
+                    NextFire[idx] := nowU + ivlU
+            }
+        }
+        if (!Toggle)
+            Return
+        ; Ближайшее событие
+        minDelayU := 0x7FFFFFFF
+        Loop % TotalGroups {
+            d := NextFire[A_Index] - nowU
+            if (d < 1)
+                d := 1
+            if (d < minDelayU)
+                minDelayU := d
+        }
+        if (!Toggle)
+            Return
+        if (minDelayU > 2000) {
+            ; Далеко (>2мс): таймер, проснуться за 1.5мс до момента
+            timerMs := (minDelayU - 1500) // 1000
+            if (timerMs < 1)
+                timerMs := 1
+            SetTimer, ToggleDeferredSendGroups, % -timerMs
+            Return
+        }
+        ; Последние 2мс: активное ожидание на QPC (максимальная точность)
+        targetU := nowU + minDelayU
+        while (QpcNowUsec() < targetU) {
+            Sleep, 0  ; отдаёт квант, но не теряет точность
+            if (!Toggle)
+                Return
+        }
+        ; Момент настал (погрешность < 0.1мс) — цикл продолжается, отправка сразу
     }
 Return
 
@@ -653,18 +871,19 @@ ToggleAction:
     if (!Toggle) {
         ReleaseAllHeldInfinite()
         SetTimer, ToggleDeferredSendGroups, Off
+        UpdateStatus()
+        UpdateIndicator()
+        Return
+    }
+    ; Инициализация абсолютного расписания (в микросекундах QPC)
+    Global NextFire
+    nowU := QpcNowUsec()
+    Loop % TotalGroups {
+        NextFire[A_Index] := nowU + (Groups[A_Index].interval * 1000)
     }
     UpdateStatus()
     UpdateIndicator()
-    Loop % TotalGroups {
-        If (Toggle) {
-            SetTimer, % "SendGroup" . A_Index, % Groups[A_Index].interval
-        } Else {
-            SetTimer, % "SendGroup" . A_Index, Off
-        }
-    }
-    if (Toggle)
-        SetTimer, ToggleDeferredSendGroups, -1
+    SetTimer, ToggleDeferredSendGroups, -1
 Return
 
 ; === Подпрограмма: перенастройка клавиш ===
@@ -674,8 +893,6 @@ RechooseKeys:
         Return
     }
     ReleaseAllHeldInfinite()
-    Loop % TotalGroups
-        SetTimer, % "SendGroup" . A_Index, Off
     Groups := [], TotalGroups := 0, CurrentGroup := 1
     KeysArray := ""
     Toggle := False
@@ -692,13 +909,24 @@ ToggleStatusGUI:
     ShowStatusGUI := !ShowStatusGUI
     If (ShowStatusGUI)
     {
-        Gui, Show, x%StatusPosX% y%StatusPosY% NoActivate AutoSize
+        ; Защита: если позиции пустые/невалидные — показать в сохранённых при создании
+        if (StatusPosX = "" || StatusPosY = "")
+            Gui, Show, NoActivate AutoSize
+        else
+            Gui, Show, x%StatusPosX% y%StatusPosY% NoActivate AutoSize
         UpdateStatus()
     }
     Else
     {
-        ; Сохраняем позицию перед скрытием
-        WinGetPos, StatusPosX, StatusPosY,,, Multi-PID Control
+        ; Сохраняем позицию перед скрытием (только если окно реально существует)
+        IfWinExist, Multi-PID Control
+        {
+            WinGetPos, StatusPosX, StatusPosY,,, Multi-PID Control
+            if (StatusPosX = "" || StatusPosY = "") {
+                StatusPosX := 0
+                StatusPosY := 0
+            }
+        }
         Gui, Hide
     }
 Return
@@ -764,61 +992,54 @@ TokenToHoldKeyspec(token) {
 }
 
 ParseKeyspecModsMain(keyspec, ByRef modifiers, ByRef mainKey) {
+    ; Модификатором может быть ЛЮБАЯ клавиша слева от последнего "+"
+    ; Формат: {Mod1+Mod2+Main} — моды зажимаются, main нажимается
     modifiers := ""
     mainKey := keyspec
-    if (RegExMatch(keyspec, "i)^(Shift|Ctrl|Alt|Win|LWin|RWin)\+(.+)$", m)) {
-        modifiers := m1
-        mainKey := m2
-    } else if (RegExMatch(keyspec, "i)^(.+)\+(Shift|Ctrl|Alt|Win|LWin|RWin)\+(.+)$", m)) {
-        modifiers := m1 . "+" . m2
-        mainKey := m3
+    plusPos := InStr(keyspec, "+", false, 0)  ; последний "+"
+    if (plusPos > 1) {
+        modifiers := SubStr(keyspec, 1, plusPos - 1)
+        mainKey := SubStr(keyspec, plusPos + 1)
+        ; Разбиваем моды по "+"
+        modifiers := StrReplace(modifiers, "+", " ")
     }
-}
-
-ModDownString(modifiers) {
-    s := ""
-    if (InStr(modifiers, "Shift"))
-        s .= "{Shift down}"
-    if (InStr(modifiers, "Ctrl"))
-        s .= "{Ctrl down}"
-    if (InStr(modifiers, "Alt"))
-        s .= "{Alt down}"
-    if (InStr(modifiers, "Win") || InStr(modifiers, "LWin") || InStr(modifiers, "RWin"))
-        s .= "{LWin down}"
-    return s
-}
-
-ModUpString(modifiers) {
-    s := ""
-    if (InStr(modifiers, "Win") || InStr(modifiers, "LWin") || InStr(modifiers, "RWin"))
-        s .= "{LWin up}"
-    if (InStr(modifiers, "Alt"))
-        s .= "{Alt up}"
-    if (InStr(modifiers, "Ctrl"))
-        s .= "{Ctrl up}"
-    if (InStr(modifiers, "Shift"))
-        s .= "{Shift up}"
-    return s
 }
 
 SendKeyspec_SimDown(h, keyspec) {
     ParseKeyspecModsMain(keyspec, modS, mainK)
     if (modS != "") {
-        md := ModDownString(modS)
-        ds := md . "{" . mainK . " down}"
-        ControlSend,, %ds%, ahk_id %h%
+        ; Любые модификаторы: зажимаем каждый по VK
+        StringSplit, modParts, modS, %A_Space%
+        Loop %modParts0% {
+            mvk := GetKeyVK(modParts%A_Index%)
+            if (mvk) {
+                mvkH := VkToHex(mvk)
+                ControlSend,, {Blind}{vk%mvkH% down}, ahk_id %h%
+            }
+        }
+        ds := "{" . mainK . " down}"
+        ControlSend,, {Blind}%ds%, ahk_id %h%
         return
     }
-    if (RegExMatch(mainK, "i)^(LButton|RButton)$")) {
+    if (RegExMatch(mainK, "i)^(LButton|RButton|MButton|XButton1|XButton2)$")) {
+        ; Асинхронная мышь: PostMessage без SendMessage - не блокирует поток
         ResolveClickClientCoords(h, mcX, mcY)
         lPar := ((mcY & 0xFFFF) << 16) | (mcX & 0xFFFF)
         root := KeyTargetGameRoot(h)
         if (!root)
             return
+        if (modS != "")
+            PostMsgModsDownFromList(h, modS)
         if (RegExMatch(mainK, "i)^RButton$"))
-            DllCall("user32\SendMessageW", "Ptr", root, "UInt", 0x204, "Ptr", 2, "Ptr", lPar, "Int")  ; WM_RBUTTONDOWN
+            PostMsgToFocus(h, 0x204, 2, lPar)
+        else if (RegExMatch(mainK, "i)^MButton$"))
+            PostMsgToFocus(h, 0x207, 4, lPar)
+        else if (RegExMatch(mainK, "i)^XButton1$"))
+            PostMsgToFocus(h, 0x20B, 8, lPar)
+        else if (RegExMatch(mainK, "i)^XButton2$"))
+            PostMsgToFocus(h, 0x20B, 16, lPar)
         else
-            DllCall("user32\SendMessageW", "Ptr", root, "UInt", 0x201, "Ptr", 1, "Ptr", lPar, "Int")  ; WM_LBUTTONDOWN
+            PostMsgToFocus(h, 0x201, 1, lPar)
         return
     }
     if (mainK = " ") {
@@ -839,21 +1060,37 @@ SendKeyspec_SimDown(h, keyspec) {
 SendKeyspec_SimUp(h, keyspec) {
     ParseKeyspecModsMain(keyspec, modS, mainK)
     if (modS != "") {
-        mu := ModUpString(modS)
-        us := "{" . mainK . " up}" . mu
-        ControlSend,, %us%, ahk_id %h%
+        us := "{" . mainK . " up}"
+        ControlSend,, {Blind}%us%, ahk_id %h%
+        ; Отпускаем моды в обратном порядке
+        StringSplit, modParts, modS, %A_Space%
+        i := modParts0
+        Loop %modParts0% {
+            mvk := GetKeyVK(modParts%i%)
+            if (mvk) {
+                mvkH := VkToHex(mvk)
+                ControlSend,, {Blind}{vk%mvkH% up}, ahk_id %h%
+            }
+            i -= 1
+        }
         return
     }
-    if (RegExMatch(mainK, "i)^(LButton|RButton)$")) {
+    if (RegExMatch(mainK, "i)^(LButton|RButton|MButton|XButton1|XButton2)$")) {
+        ; Асинхронная мышь: PostMessage
         ResolveClickClientCoords(h, mcX, mcY)
         lPar := ((mcY & 0xFFFF) << 16) | (mcX & 0xFFFF)
-        root := KeyTargetGameRoot(h)
-        if (!root)
-            return
         if (RegExMatch(mainK, "i)^RButton$"))
-            DllCall("user32\SendMessageW", "Ptr", root, "UInt", 0x205, "Ptr", 0, "Ptr", lPar, "Int")  ; WM_RBUTTONUP
+            PostMsgToFocus(h, 0x205, 0, lPar)
+        else if (RegExMatch(mainK, "i)^MButton$"))
+            PostMsgToFocus(h, 0x208, 0, lPar)
+        else if (RegExMatch(mainK, "i)^XButton1$"))
+            PostMsgToFocus(h, 0x20C, 8, lPar)
+        else if (RegExMatch(mainK, "i)^XButton2$"))
+            PostMsgToFocus(h, 0x20C, 16, lPar)
         else
-            DllCall("user32\SendMessageW", "Ptr", root, "UInt", 0x202, "Ptr", 0, "Ptr", lPar, "Int")  ; WM_LBUTTONUP
+            PostMsgToFocus(h, 0x202, 0, lPar)
+        if (modS != "")
+            PostMsgModsUpFromList(h, modS)
         return
     }
     if (mainK = " ") {
@@ -874,17 +1111,27 @@ SendKeyspec_SimUp(h, keyspec) {
 SendKeyspec_PostDown(h, keyspec) {
     ParseKeyspecModsMain(keyspec, modS, mainK)
     if (modS != "") {
-        PostMsgModsDownFromString(h, modS)
+        ; Любые модификаторы (включая обычные клавиши) зажимаются
+        PostMsgModsDownFromList(h, modS)
         vk := GetKeyVK(mainK)
         if (vk)
             PostMsgToFocus(h, 0x100, vk, PostMsgKeyLP(vk, 0, h))
         return
     }
-    if (RegExMatch(mainK, "i)^(LButton|RButton)$")) {
+    if (RegExMatch(mainK, "i)^(LButton|RButton|MButton|XButton1|XButton2)$")) {
         ResolveClickClientCoords(h, mcX, mcY)
         lPar := ((mcY & 0xFFFF) << 16) | (mcX & 0xFFFF)
+        ; Зажимаем моды перед кликом
+        if (modS != "")
+            PostMsgModsDownFromList(h, modS)
         if (RegExMatch(mainK, "i)^RButton$"))
             PostMsgToFocus(h, 0x204, 2, lPar)
+        else if (RegExMatch(mainK, "i)^MButton$"))
+            PostMsgToFocus(h, 0x207, 4, lPar)
+        else if (RegExMatch(mainK, "i)^XButton1$"))
+            PostMsgToFocus(h, 0x20B, 8, lPar)
+        else if (RegExMatch(mainK, "i)^XButton2$"))
+            PostMsgToFocus(h, 0x20B, 16, lPar)
         else
             PostMsgToFocus(h, 0x201, 1, lPar)
         return
@@ -922,16 +1169,25 @@ SendKeyspec_PostUp(h, keyspec) {
         vk := GetKeyVK(mainK)
         if (vk)
             PostMsgToFocus(h, 0x101, vk, PostMsgKeyLP(vk, 1, h))
-        PostMsgModsUpFromString(h, modS)
+        PostMsgModsUpFromList(h, modS)
         return
     }
-    if (RegExMatch(mainK, "i)^(LButton|RButton)$")) {
+    if (RegExMatch(mainK, "i)^(LButton|RButton|MButton|XButton1|XButton2)$")) {
         ResolveClickClientCoords(h, mcX, mcY)
         lPar := ((mcY & 0xFFFF) << 16) | (mcX & 0xFFFF)
         if (RegExMatch(mainK, "i)^RButton$"))
             PostMsgToFocus(h, 0x205, 0, lPar)
+        else if (RegExMatch(mainK, "i)^MButton$"))
+            PostMsgToFocus(h, 0x208, 0, lPar)
+        else if (RegExMatch(mainK, "i)^XButton1$"))
+            PostMsgToFocus(h, 0x20C, 8, lPar)
+        else if (RegExMatch(mainK, "i)^XButton2$"))
+            PostMsgToFocus(h, 0x20C, 16, lPar)
         else
             PostMsgToFocus(h, 0x202, 0, lPar)
+        ; Отпускаем моды после клика
+        if (modS != "")
+            PostMsgModsUpFromList(h, modS)
         return
     }
     if (StrLen(mainK) = 1 && mainK != " ") {
@@ -987,15 +1243,32 @@ VkToHex(vk) {
     return h
 }
 
-; === Отправка клавиш для групп ===
-SendGroup1:
-SendGroup2:
-SendGroup3:
-SendGroup4:
-SendGroup5:
-    groupNum := RegExReplace(A_ThisLabel, "SendGroup", "")
-    SendGroupKeys(groupNum)
-Return
+; --- Имя клавиши по VK (для отслеживания зажатых) ---
+VkKeyName(vk) {
+    static names := {}
+    if (!names.Count()) {
+        names[0x14] := "CapsLock"
+        names[0x1B] := "Esc"
+        names[0x09] := "Tab"
+        names[0x08] := "Backspace"
+        names[0x2E] := "Delete"
+        names[0x2D] := "Insert"
+        names[0x24] := "Home"
+        names[0x23] := "End"
+        names[0x22] := "PageDown"
+        names[0x21] := "PageUp"
+        names[0x20] := "Space"
+        names[0x2C] := "PrintScreen"
+        names[0x13] := "Pause"
+        Loop 26
+            names[0x40 + A_Index] := Chr(0x40 + A_Index)
+        Loop 10
+            names[0x2F + A_Index] := Chr(0x2F + A_Index)
+        Loop 12
+            names[0x6F + A_Index] := "F" . A_Index
+    }
+    return names.HasKey(vk) ? names[vk] : ""
+}
 
 ; === Отправка клавиш ===
 SendGroupKeys(groupIndex) {
@@ -1487,7 +1760,7 @@ ChooseMouseHoldDetectTimer:
         return
     GuiControlGet, hm,, GroupInterval
     if (hm = "")
-        holdMs := DefaultInterval
+        holdMs := 0
     else
         holdMs := hm + 0
     if (holdMs < 0)
@@ -1506,7 +1779,7 @@ ChooseHoldDetectTimer:
         return
     GuiControlGet, hm,, GroupInterval
     if (hm = "")
-        holdMs := DefaultInterval
+        holdMs := 0
     else
         holdMs := hm + 0
     if (holdMs < 0)
@@ -1521,15 +1794,38 @@ return
 
 KeyDownMsg(wParam, lParam) {
     Global KeysArray, IsChoosingKeys, ChoosePendingVk, ChoosePendingToken, ChoosePendingStart, ChooseHoldWaitUpVk
+    Global KeyListArmed
     If (!IsChoosingKeys)
         Return
-    ControlGetFocus, FocusedControl
-    If (FocusedControl = "Edit2")
+    ; Фильтр поля интервала: только цифры, Backspace, Delete, стрелки (по HWND — надёжно)
+    Global hGroupInterval
+    ; Определяем HWND контрола с фокусом через GetGUIThreadInfo
+    ; x64: cbSize=72, hwndFocus на смещении 16
+    VarSetCapacity(gti, 72, 0)
+    NumPut(72, gti, 0, "UInt")
+    DllCall("GetGUIThreadInfo", "UInt", 0, "Ptr", &gti)
+    focusedHwnd := NumGet(gti, 16, "Ptr")
+    If (focusedHwnd && focusedHwnd = hGroupInterval)
+    {
+        vk := wParam
+        isDigit := (vk >= 0x30 && vk <= 0x39) || (vk >= 0x60 && vk <= 0x69)
+        isNavKey := (vk = 0x08 || vk = 0x2E || vk = 0x25 || vk = 0x26 || vk = 0x27 || vk = 0x28 || vk = 0x24 || vk = 0x23) ; BS Del Left Up Right Down Home End
+        ; Ctrl-комбинации разрешаем (Ctrl+A выделить всё, Ctrl+C/V/X)
+        ctrlHeld := GetKeyState("Ctrl", "P")
+        If (isDigit || isNavKey || ctrlHeld)
+            Return  ; разрешаем системе обработать
+        Return 1  ; блокируем остальные символы
+    }
+    If (!KeyListArmed)
         Return
     ChooseFlushMousePendingIfAny()
     vk := wParam
     if (ChooseHoldWaitUpVk && vk = ChooseHoldWaitUpVk)
         Return
+    ; Блокируем системное действие навигационных клавиш (Enter/Space/Tab/Esc
+    ; иначе они "нажимают" сфокусированную кнопку GUI и меняют фокус)
+    if (vk = 0x0D || vk = 0x20 || vk = 0x09 || vk = 0x1B || vk = 0x08)
+        Return 1
     scanCode := (lParam >> 16) & 0xFF
     extended := (lParam >> 24) & 0x01
     isCtrlPressed := GetKeyState("Ctrl", "P")
@@ -1555,13 +1851,15 @@ KeyDownMsg(wParam, lParam) {
             }
         }
         if (!keyName) {
-            VarSetCapacity(scancode, 4), DllCall("MapVirtualKey", "UInt", vk, "Int", 0, "Ptr", &scancode)
-            scancode := NumGet(scancode, 0, "UInt")
-            VarSetCapacity(keyState, 256, 0), DllCall("GetKeyboardState", "Ptr", &keyState)
-            VarSetCapacity(char, 4, 0), res := DllCall("ToUnicode", "UInt", vk, "UInt", scancode, "Ptr", &keyState, "Ptr", &char, "Int", 2, "UInt", 0)
-            if (res > 0) {
-                char := StrGet(&char, res, "UTF-16")
-                keyName := (extended && (scancode >= 0x47 && scancode <= 0x53)) ? "Numpad" char : char
+            ; Имя по раскладке через GetKeyNameText (надёжно при Ctrl/Alt, даёт "Ф"/"A")
+            sc := DllCall("user32\MapVirtualKeyW", "UInt", vk, "UInt", 0, "UInt")
+            scanFull := (sc << 16) | ((extended & 1) << 24)
+            VarSetCapacity(kbName, 128, 0)
+            len := DllCall("user32\GetKeyNameTextW", "Int", scanFull, "Ptr", &kbName, "Int", 64)
+            if (len > 0) {
+                keyName := StrGet(&kbName, len, "UTF-16")
+                ; Очистка от суффиксов типа "(Numpad 5)"
+                keyName := RegExReplace(keyName, "\s*\(.*\)\s*$", "")
             } else if ((vk >= 0x41 && vk <= 0x5A) || (vk >= 0x30 && vk <= 0x39)) {
                 keyName := Chr(vk)
             }
@@ -1569,7 +1867,48 @@ KeyDownMsg(wParam, lParam) {
     }
     If (keyName = "")
         Return
-    combination := (isWinPressed ? "Win+" : "") . (isCtrlPressed ? "Ctrl+" : "") . (isAltPressed ? "Alt+" : "") . (isShiftPressed ? "Shift+" : "") . keyName
+    ; === Определяем какие ещё клавиши зажаты (кроме стандартных модов) ===
+    heldKeys := ""
+    if (isCtrlPressed)
+        heldKeys .= "Ctrl "
+    if (isAltPressed)
+        heldKeys .= "Alt "
+    if (isShiftPressed)
+        heldKeys .= "Shift "
+    if (isWinPressed)
+        heldKeys .= "Win "
+    ; CapsLock как модификатор
+    if (GetKeyState("CapsLock", "T") && vk != 0x14)
+        heldKeys .= "CapsLock "
+    ; Другие зажатые клавиши из списка отслеживания
+    static trackVk := [0x14, 0x1B, 0x09, 0x08, 0x2E, 0x2D, 0x24, 0x23, 0x22, 0x21, 0x20]  ; Caps Esc Tab BS Del Ins Home End PgDn PgUp Space
+    Loop % trackVk.Length() {
+        tvk := trackVk[A_Index]
+        if (tvk = vk)
+            continue
+        if (GetKeyState("vk" . VkToHex(tvk), "P"))
+            heldKeys .= VkKeyName(tvk) . " "
+    }
+    ; Если есть уже отслеживаемая зажатая клавиша (ChoosePendingVk) — она тоже модификатор
+    if (ChoosePendingVk && ChoosePendingVk != vk && ChoosePendingToken != "") {
+        pendKey := TokenToHoldKeyspec(ChoosePendingToken)
+        ; Берём имя без скобок
+        pendKey := RegExReplace(pendKey, "^\{?", "")
+        pendKey := RegExReplace(pendKey, "\}?$", "")
+        heldKeys .= pendKey . " "
+    }
+    ; === Собираем комбинацию: моды + текущая клавиша ===
+    combination := ""
+    if (heldKeys != "") {
+        ; Убираем дубли, формируем "Mod1+Mod2"
+        StringSplit, hkParts, heldKeys, %A_Space%
+        Loop %hkParts0% {
+            part := hkParts%A_Index%
+            if (part != "" && !InStr(combination, part . "+") && !InStr(combination, "+" . part . "+"))
+                combination .= part . "+"
+        }
+    }
+    combination .= keyName
     needBrace := (InStr(combination, "+") || StrLen(keyName) > 1 || RegExMatch(keyName, "^[A-Z]"))
     if (!needBrace && StrLen(keyName) = 1) {
         ac := Asc(SubStr(keyName, 1, 1))
@@ -1577,11 +1916,43 @@ KeyDownMsg(wParam, lParam) {
             needBrace := true
     }
     token := needBrace ? "{" combination "}" : keyName
-    if (ChoosePendingVk && ChoosePendingVk != vk) {
+    ; === Есть отслеживаемая клавиша? НЕ флашим — объединяем в комбинацию ===
+    if (ChoosePendingVk && ChoosePendingVk != vk && ChoosePendingToken != "") {
+        ; Вытаскиваем её имя, добавляем в начало комбинации
+        pendSpec := TokenToHoldKeyspec(ChoosePendingToken)
+        pendMain := pendSpec
+        pPlus := InStr(pendSpec, "+", false, 0)
+        if (pPlus > 1) {
+            pendMods := SubStr(pendSpec, 1, pPlus - 1)
+            pendMain := SubStr(pendSpec, pPlus + 1)
+        } else {
+            pendMods := ""
+        }
+        ; Новая комбинация: pendMods + pendMain + (уже собранные моды) + keyName
+        newComb := ""
+        if (pendMods != "")
+            newComb .= pendMods . "+"
+        newComb .= pendMain . "+"
+        ; Добавляем моды из heldKeys (без дублирования pendMain)
+        if (heldKeys != "") {
+            StringSplit, hkParts2, heldKeys, %A_Space%
+            Loop %hkParts2_0% {
+                part := hkParts2%A_Index%
+                if (part != "" && part != pendMain && !InStr(newComb, part . "+") && !InStr(newComb, "+" . part . "+"))
+                    newComb .= part . "+"
+            }
+        }
+        newComb .= keyName
+        token := "{" newComb "}"
+        ; Сбрасываем pending — теперь он часть комбинации
         SetTimer, ChooseHoldDetectTimer, Off
-        KeysArray .= (KeysArray ? " " : "") . ChoosePendingToken
-        GuiControl,, KeyList, %KeysArray%
         ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
+        ; Начинаем отслеживать всю комбинацию как новую pending
+        ChoosePendingVk := vk
+        ChoosePendingToken := token
+        ChoosePendingStart := A_TickCount
+        SetTimer, ChooseHoldDetectTimer, -1000
+        Return
     }
     if (ChoosePendingVk = vk)
         Return
@@ -1594,7 +1965,10 @@ KeyDownMsg(wParam, lParam) {
 
 KeyUpMsg(wParam, lParam) {
     Global KeysArray, IsChoosingKeys, ChoosePendingVk, ChoosePendingToken, ChoosePendingStart, ChooseHoldWaitUpVk, DefaultInterval
+    Global KeyListArmed
     If (!IsChoosingKeys)
+        Return
+    If (!KeyListArmed)
         Return
     ControlGetFocus, FocusedControl
     If (FocusedControl = "Edit2")
@@ -1612,7 +1986,7 @@ KeyUpMsg(wParam, lParam) {
     elapsed := A_TickCount - ChoosePendingStart
     GuiControlGet, hm,, GroupInterval
     if (hm = "")
-        holdMs := DefaultInterval
+        holdMs := 0
     else
         holdMs := hm + 0
     if (holdMs < 0)
@@ -1628,8 +2002,363 @@ KeyUpMsg(wParam, lParam) {
 
 ; === Подпрограмма выхода ===
 ExitApp:
+    ; При активном захвате клавиш — записать NumpadSub как бинд, не выходить
+    if (CaptureGlobalKeyAsBind(0x6D, "NumpadSub"))
+        Return
     ReleaseAllHeldInfinite()
+    SetTimer, TimerTick, Off
     ; Восстанавливаем стандартную точность таймера
     DllCall("winmm\timeEndPeriod", "UInt", 1)
     ExitApp
 Return
+
+; ======================================================================
+; === СИСТЕМА ТАЙМЕРОВ ===
+; ======================================================================
+
+; --- Открытие окна добавления таймера ---
+AddTimerGui:
+    KeyListArmed := false
+    Gui, TimerWin:Destroy
+    Gui, TimerWin:Add, Text, x10 y10, Timer name:
+    Gui, TimerWin:Add, Edit, x10 y30 w220 vNewTimerName, % "Timer " (Timers0 + 1)
+    Gui, TimerWin:Add, Text, x10 y60, Duration (seconds):
+    Gui, TimerWin:Add, Edit, x10 y80 w220 vNewTimerDuration
+    Gui, TimerWin:Add, Button, x10 y110 w100 gSaveNewTimer, OK
+    Gui, TimerWin:Add, Button, x+10 y110 w100 gTimerWinCancel, Cancel
+    Gui, TimerWin:Show, w240 h150, Add Timer
+Return
+
+TimerWinCancel:
+    Gui, TimerWin:Destroy
+Return
+
+TimerWinGuiClose:
+    Gui, TimerWin:Destroy
+Return
+
+SaveNewTimer:
+    Gui, TimerWin:Submit
+    if (NewTimerName = "" || NewTimerDuration = "" || NewTimerDuration < 1) {
+        MsgBox, 48, Add Timer, Enter name and duration (seconds, > 0).
+        return
+    }
+    if (Timers0 >= 3) {
+        MsgBox, 48, Add Timer, Maximum 3 timers.
+        return
+    }
+    Timers0 += 1
+    idx := Timers0
+    Timers%idx%_Name := NewTimerName
+    Timers%idx%_Duration := NewTimerDuration + 0
+    Timers%idx%_Remaining := Timers%idx%_Duration * 1000
+    Timers%idx%_Active := false
+    Gui, TimerWin:Destroy
+    RefreshTimerInfo()
+Return
+
+; --- Обновление строки списка таймеров в окне выбора клавиш ---
+RefreshTimerInfo() {
+    txt := BuildTimerListShort()
+    GuiControl,, TimerInfoText, %txt%
+}
+
+BuildTimerListShort() {
+    Global Timers0
+    if (Timers0 = 0)
+        return "Timers: none"
+    out := ""
+    Loop %Timers0% {
+        nm := Timers%A_Index%_Name
+        dur := Timers%A_Index%_Duration
+        out .= A_Index ". " nm " (" dur "s)  "
+    }
+    return "Timers: " out
+}
+
+; --- Старт/пауза всех таймеров (NumpadDiv) ---
+ToggleAllTimers:
+    if (Timers0 = 0) {
+        ShowToolTipMsg("No timers configured")
+        return
+    }
+    TimerEnabled := !TimerEnabled
+    if (TimerEnabled) {
+        Loop %Timers0% {
+            Timers%A_Index%_Active := true
+            Timers%A_Index%_Start := A_TickCount
+        }
+        SetTimer, TimerTick, 200
+        SoundBeep, 800, 150
+    } else {
+        SoundBeep, 400, 150
+    }
+    UpdateStatus()
+Return
+
+; --- Отдельные таймеры (Numpad7/8/9) ---
+ToggleTimer1:
+    ToggleOneTimer(1)
+Return
+ToggleTimer2:
+    ToggleOneTimer(2)
+Return
+ToggleTimer3:
+    ToggleOneTimer(3)
+Return
+
+ToggleOneTimer(idx) {
+    Global Timers0, TimerEnabled
+    if (idx > Timers0) {
+        ShowToolTipMsg("Timer " idx " does not exist")
+        return
+    }
+    wasActive := Timers%idx%_Active
+    Timers%idx%_Active := !wasActive
+    if (Timers%idx%_Active) {
+        Timers%idx%_Start := A_TickCount
+        TimerEnabled := true
+        SetTimer, TimerTick, 200
+        SoundBeep, 700, 120
+    } else {
+        CheckAnyTimerActive()
+        SoundBeep, 350, 120
+    }
+    UpdateStatus()
+}
+
+CheckAnyTimerActive() {
+    Global Timers0, TimerEnabled
+    TimerEnabled := false
+    Loop %Timers0% {
+        if (Timers%A_Index%_Active) {
+            TimerEnabled := true
+            break
+        }
+    }
+    if (!TimerEnabled)
+        SetTimer, TimerTick, Off
+}
+
+; --- Основной цикл таймеров (тикает каждые 200мс) ---
+TimerTick:
+    Global Timers0, TimerEnabled
+    if (!TimerEnabled)
+        return
+    Loop %Timers0% {
+        if (!Timers%A_Index%_Active)
+            continue
+        elapsed := A_TickCount - Timers%A_Index%_Start
+        rem := (Timers%A_Index%_Duration * 1000) - elapsed
+        Timers%A_Index%_Remaining := rem
+        if (rem <= 0) {
+            Timers%A_Index%_Active := false
+            Timers%A_Index%_Remaining := 0
+            ShowTimerAlert(A_Index)
+            return
+        }
+    }
+    CheckAnyTimerActive()
+    UpdateStatus()
+Return
+
+; --- Оповещение об окончании ---
+ShowTimerAlert(idx) {
+    Global Timers0, TimerEnabled
+    nm := Timers%idx%_Name
+    dur := Timers%idx%_Duration
+    ; Звук: 3 сигнала
+    SoundBeep, 1000, 300
+    Sleep, 150
+    SoundBeep, 1200, 300
+    Sleep, 150
+    SoundBeep, 1500, 400
+    MsgBox, 36, Timer Expired!, Timer "%nm%" (%dur%s) has expired!`n`nRestart this timer?
+    IfMsgBox, Yes
+    {
+        Timers%idx%_Active := true
+        Timers%idx%_Start := A_TickCount
+        Timers%idx%_Remaining := Timers%idx%_Duration * 1000
+        TimerEnabled := true
+        SetTimer, TimerTick, 200
+    }
+    else
+    {
+        CheckAnyTimerActive()
+    }
+    UpdateStatus()
+}
+
+; --- Вспомогательная функция: ToolTip на 1.5 сек ---
+ShowToolTipMsg(msg) {
+    ToolTip, %msg%
+    SetTimer, ClearToolTip, -1500
+}
+
+ClearToolTip:
+    ToolTip
+Return
+
+; --- Форматирование времени MM:SS ---
+TimerFormatMs(ms) {
+    totalSec := Floor(ms / 1000)
+    m := Floor(totalSec / 60)
+    s := Mod(totalSec, 60)
+    return SubStr("0" m, -1) ":" SubStr("0" s, -1)
+}
+
+; --- Строка таймеров для статус-панели ---
+BuildTimerStatusLines() {
+    Global Timers0
+    if (Timers0 = 0)
+        return ""
+    out := ""
+    Loop %Timers0% {
+        nm := Timers%A_Index%_Name
+        dur := Timers%A_Index%_Duration * 1000
+        rem := Timers%A_Index%_Remaining
+        act := Timers%A_Index%_Active
+        st := act ? ">" : "|"
+        remStr := TimerFormatMs(rem)
+        durStr := TimerFormatMs(dur)
+        ; Прогресс-бар из 8 символов
+        if (dur > 0)
+            prog := Floor((rem / dur) * 8)
+        else
+            prog := 0
+        bar := ""
+        Loop 8 {
+            bar .= (A_Index <= prog) ? "#" : "-"
+        }
+        out .= st " " nm ": " remStr "/" durStr " " bar
+        if (A_Index < Timers0)
+            out .= "`n"
+    }
+    return out
+}
+
+; ======================================================================
+; === ДИНАМИЧЕСКИЙ МОНИТОРИНГ ПРОЦЕССОВ ===
+; ======================================================================
+
+; --- Запуск мониторинга (вызывается после настройки процессов) ---
+StartProcessMonitor() {
+    SetTimer, ProcessMonitorTick, 1000
+}
+
+; --- Тик мониторинга: удаляем мёртвые, добавляем новые окна по имени ---
+ProcessMonitorTick:
+    if (IsChoosingKeys || TotalProcesses = 0)
+        return
+    changed := RefreshProcessList()
+    if (changed)
+        UpdateStatus()
+Return
+
+; --- Пересборка списка процессов: возвращает 1 если состав изменился ---
+RefreshProcessList() {
+    Global TargetPIDArray, TargetProcessArray, TargetHwndArray, TotalProcesses
+    changed := 0
+
+    ; Шаг 1: удаляем мёртвые PID
+    newPids := [], newNames := [], newHwnds := []
+    Loop % TotalProcesses {
+        pid := TargetPIDArray[A_Index]
+        nm := TargetProcessArray[A_Index]
+        h := TargetHwndArray[A_Index]
+        if (ProcessExist(pid)) {
+            ; Жив — проверяем что окно ещё валидно, иначе ищем новое окно того же процесса
+            if (!h || !DllCall("user32\IsWindow", "Ptr", h)) {
+                newH := FindWindowForPid(pid)
+                if (newH) {
+                    h := newH
+                    changed := 1
+                }
+            }
+            newPids.Push(pid), newNames.Push(nm), newHwnds.Push(h)
+        } else {
+            changed := 1  ; процесс умер
+        }
+    }
+    aliveNames := {}
+    Loop % newPids.Length()
+        aliveNames[newNames[A_Index]] := 1
+
+    ; Шаг 2: ищем новые окна процессов по тем же именам
+    for exeName, _ in aliveNames {
+        DetectHiddenWindows, On
+        WinGet, hwndList, List, ahk_exe %exeName%
+        DetectHiddenWindows, Off
+        Loop %hwndList% {
+            h := hwndList%A_Index% + 0
+            r := DllCall("user32\GetAncestor", "Ptr", h, "UInt", 2, "Ptr")
+            if (!r)
+                r := h
+            ; Уже отслеживаем этот корневой HWND?
+            already := 0
+            Loop % newHwnds.Length() {
+                if (newHwnds[A_Index] = r) {
+                    already := 1
+                    break
+                }
+            }
+            if (already)
+                continue
+            vis := DllCall("user32\IsWindowVisible", "Ptr", r)
+            ico := DllCall("user32\IsIconic", "Ptr", r)
+            if (!vis && !ico)
+                continue
+            WinGet, wpid, PID, ahk_id %r%
+            ; Уже отслеживаем этот PID?
+            pidDup := 0
+            Loop % newPids.Length() {
+                if (newPids[A_Index] = wpid) {
+                    pidDup := 1
+                    break
+                }
+            }
+            if (pidDup)
+                continue
+            ; Новый процесс — добавляем
+            newPids.Push(wpid), newNames.Push(exeName), newHwnds.Push(r)
+            changed := 1
+        }
+    }
+
+    ; Шаг 3: применяем изменения
+    if (changed) {
+        TargetPIDArray := newPids
+        TargetProcessArray := newNames
+        TargetHwndArray := newHwnds
+        TotalProcesses := newPids.Length()
+        ; Если все процессы умерли — останавливаем отправку
+        if (TotalProcesses = 0 && Toggle) {
+            Toggle := false
+            ReleaseAllHeldInfinite()
+            SetTimer, ToggleDeferredSendGroups, Off
+            UpdateIndicator()
+        }
+    }
+    return changed
+}
+
+; --- Проверка жив ли процесс по PID ---
+ProcessExist(pid) {
+    Process, Exist, %pid%
+    return ErrorLevel
+}
+
+; --- Поиск нового окна для живого PID ---
+FindWindowForPid(pid) {
+    DetectHiddenWindows, On
+    WinGet, hl, List, ahk_pid %pid%
+    DetectHiddenWindows, Off
+    Loop %hl% {
+        h := hl%A_Index% + 0
+        r := DllCall("user32\GetAncestor", "Ptr", h, "UInt", 2, "Ptr")
+        if (!r)
+            r := h
+        return r
+    }
+    return 0
+}

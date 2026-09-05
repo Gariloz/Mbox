@@ -1,12 +1,16 @@
 ; === Настройки ===
 DefaultInterval := 500                  ; Интервал по умолчанию для новых групп (мс)
-KeyDelay := 0                           ; Задержка между клавишами в последовательности (мс)
-; UseSimulation=true  — симуляция: клавиши и мышь — ControlSend / ControlClick на тот же HWND цели (TargetHwndArray).
+KeyDelay := 0                           ; Задержка между клавишами в последовательности (мс); для WM-мыши — доп. пауза после SetCursorPos (минимум несколько мс)
+; UseSimulation=true  — симуляция: клавиши и мышь — ControlSend / ControlClick на HWND из списка целей этой группы.
 ; UseSimulation=false — прямая отправка: клавиши — PostMsgToFocus / PostTapVkFocused; мышь — те же три WM через PostMsgToFocus (MOVE + DOWN + UP).
 UseSimulation := false
 ShowStatusGUI := true                   ; Показывать окно статуса (true/false)
 StatusPosX := 0                         ; X позиция окна статуса
 StatusPosY := 0                         ; Y позиция окна статуса
+StatusFontSize := 9                     ; Размер шрифта окна статуса (компактнее = меньше число)
+StatusGuiMaxChars := 52                 ; Макс. длина строки в символах; длиннее — «...»
+ProcessInputBoxW := 380                 ; Ширина (px), по умолчанию у InputBox ~372 — не растягиваем широко
+ProcessInputBoxH := 230                 ; Высота (px), чтобы примеры текста помещались
 IndicatorEnabled := true                ; Показывать точку-индикатор (true/false)
 IndicatorBlink := false                 ; Мигать (true/false). Если false: просто зелёный/красный
 IndicatorSize := 10                     ; Размер точки (px)
@@ -25,10 +29,11 @@ ChangeKeysKey := "NumpadAdd"            ; Клавиша для сброса и 
 ExitKey := "NumpadSub"                  ; Клавиша выхода из скрипта
 ToggleGUIKey := "NumpadDot"             ; Клавиша для показа/скрытия окна статуса
 DisableAllKey := "NumpadMult"           ; Клавиша полного отключения/включения всех биндов
-ToggleModeKey := "Numpad0"              ; Переключение: симуляция (ControlSend) / прямая отправка (WM)
+ToggleModeKey := "NumpadDiv"            ; Переключение: симуляция (ControlSend) / прямая отправка (WM)
 
 ; === Системные настройки ===
 #Persistent
+#SingleInstance Force
 SetBatchLines -1
 #UseHook
 
@@ -51,14 +56,36 @@ ChoosePendingMouseToken := ""
 ChoosePendingMouseStart := 0
 ChooseHoldWaitUpMouse := 0
 HeldInfinite := []
+PendingGroupForTargets := 0
+LastPromptTargetsOk := false
+SendGroup_ExecHwnds := ""
+SendGroup_ExecN := 0
+SendGroup_MouseFixed := false
+SendGroup_MouseCX := ""
+SendGroup_MouseCY := ""
+SendGroup_MouseNoMove := false
+MouseCoordPendingGi := 0
+MccPickHw := 0
+MouseCoordModalResult := 0
+; 0 = нет итога, 1 = отмена (крестик/Escape/окно пропало), 2 = OK, 3 = Default (курсор)
+MouseCoordExitReason := 0
+KeyPickHwnd := 0
+StatusBarHwnd := 0
+MousePostSnapLock := 0
+MousePostSnapOx := 0
+MousePostSnapOy := 0
+MousePostSnapHaveSave := false
 
 ; === Динамические горячие клавиши ===
 Hotkey, % "$" . StartStopKey, ToggleAction
 Hotkey, % "$" . ChangeKeysKey, RechooseKeys
 Hotkey, % "$" . ToggleGUIKey, ToggleStatusGUI
-Hotkey, % ExitKey, ExitApp
+; В v1 третий параметр Hotkey — имя метки; «ExitApp» без метки даёт Target label does not exist
+Hotkey, % ExitKey, MboxDoExit
 Hotkey, % "$" . DisableAllKey, ToggleBindLock
 Hotkey, % "$" . ToggleModeKey, ToggleSendMode
+
+OnExit, MboxOnExitCleanup
 
 InitIndicator()
 
@@ -76,22 +103,19 @@ SetMainHotkeys(state) {
 }
 
 ToggleBindLock:
-    Global GlobalBindsDisabled, IsChoosingKeys, TotalProcesses, TotalGroups
+    Global GlobalBindsDisabled, IsChoosingKeys, TotalGroups
     GlobalBindsDisabled := !GlobalBindsDisabled
     if (GlobalBindsDisabled) {
         SetMainHotkeys("Off")
-    } else {
-        if (!IsChoosingKeys && TotalProcesses > 0 && TotalGroups > 0)
-            SetMainHotkeys("On")
+    } else if (!IsChoosingKeys && GroupsConfigured()) {
+        SetMainHotkeys("On")
     }
     UpdateStatus()
     InitIndicator()
 Return
 
 ToggleSendMode:
-    Global UseSimulation, IsChoosingKeys, TotalProcesses, TotalGroups
-    if (IsChoosingKeys)
-        Return
+    Global UseSimulation, TotalGroups
     UseSimulation := !UseSimulation
     UpdateStatus()
     ToolTip, % UseSimulation ? "Режим: симуляция (ControlSend)" : "Режим: прямая отправка (WM)"
@@ -103,7 +127,9 @@ ToggleSendModeTipOff:
 Return
 
 ; === Захват кликов мыши в окне выбора клавиш ===
-#If (IsChoosingKeys && WinActive("Key Selection"))
+; Нельзя привязывать LButton Up к WinActive("Key Selection"): между Down и Up фокус/активное окно
+; может смениться — тогда Up не срабатывает, таймер даёт ложный «удержание» мыши.
+#If (IsChoosingKeys)
 ~LButton::
     MouseChooseButtonDown(1, "{LButton}")
 Return
@@ -124,7 +150,7 @@ ChooseFlushKeyboardPendingIfAny() {
         return
     SetTimer, ChooseHoldDetectTimer, Off
     KeysArray .= (KeysArray ? " " : "") . ChoosePendingToken
-    GuiControl,, KeyList, %KeysArray%
+    KeyPickRefreshList()
     ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
 }
 
@@ -134,13 +160,30 @@ ChooseFlushMousePendingIfAny() {
         return
     SetTimer, ChooseMouseHoldDetectTimer, Off
     KeysArray .= (KeysArray ? " " : "") . ChoosePendingMouseToken
-    GuiControl,, KeyList, %KeysArray%
+    KeyPickRefreshList()
     ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
 }
 
+KeyPickRefreshList() {
+    Global KeysArray, KeyPickHwnd
+    if (!KeyPickHwnd || !WinExist("ahk_id " . KeyPickHwnd))
+        return
+    Gui, KeyPick:Default
+    GuiControl,, KeyList, %KeysArray%
+}
+
+; Фокус на списке клавиш: иначе при фокусе на кнопке пробел «нажимает» кнопку (Clear и т.д.), а не добавляет Space.
+KeyPickFocusKeyList() {
+    Global KeyPickHwnd
+    if (!KeyPickHwnd || !WinExist("ahk_id " . KeyPickHwnd))
+        return
+    Gui, KeyPick:Default
+    GuiControl, Focus, KeyList
+}
+
 MouseChooseButtonDown(btn, token) {
-    Global IsChoosingKeys, ChoosePendingMouseBtn, ChoosePendingMouseToken, ChoosePendingMouseStart, ChooseHoldWaitUpMouse
-    if (!IsChoosingKeys || !WinActive("Key Selection"))
+    Global IsChoosingKeys, ChoosePendingMouseBtn, ChoosePendingMouseToken, ChoosePendingMouseStart, ChooseHoldWaitUpMouse, KeyPickHwnd
+    if (!IsChoosingKeys || !KeyPickHwnd || !WinActive("ahk_id " . KeyPickHwnd))
         return
     MouseGetPos, , , , ctrl, 1
     if (RegExMatch(ctrl, "i)^Button\d+$"))
@@ -174,6 +217,7 @@ MouseChooseButtonUp(btn) {
         return
     SetTimer, ChooseMouseHoldDetectTimer, Off
     elapsed := A_TickCount - ChoosePendingMouseStart
+    Gui, KeyPick:Default
     GuiControlGet, hm,, GroupInterval
     if (hm = "")
         holdMs := DefaultInterval
@@ -187,25 +231,29 @@ MouseChooseButtonUp(btn) {
     else
         KeysArray .= (KeysArray ? " " : "") . "{HOLD" . holdMs . "|" . keyspec . "}"
     ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
-    GuiControl,, KeyList, %KeysArray%
+    KeyPickRefreshList()
 }
 
 ; === Выбор клавиш ===
 ChooseKeys:
+    Global StatusBarHwnd, KeyPickHwnd
     IsChoosingKeys := True
     SetMainHotkeys("Off")
-    Gui, Destroy
-    Gui, Font, s10
+    if (StatusBarHwnd && WinExist("ahk_id " . StatusBarHwnd)) {
+        Gui, StatusBar:Destroy
+        StatusBarHwnd := 0
+    }
+    Gui, KeyPick:New, +HwndKeyPickHwnd +LabelKeyPick
+    Gui, KeyPick:Font, s10
     titleText := "Group " . CurrentGroup . " - Click on the buttons you want the script to press."
-    Gui, Add, Text, x10 y10 w380 Center, %titleText%
-    Gui, Add, Edit, x25 y35 vKeyList w350 r5 ReadOnly
-    Gui, Add, Text, x25 y135, Interval (ms):
-    Gui, Add, Edit, x105 y130 vGroupInterval w60, %DefaultInterval%
-    Gui, Add, Button, x25 y160 gConfirmKeys, Confirm Selection
-    Gui, Add, Button, x+10 gClearKeys, Clear buttons
-    Gui, Add, Button, x+10 gAddAnotherGroup, Add Another Group
-    Gui, Show, w400 h200, Key Selection
-    OnMessage(0x112, "GuiClose")
+    Gui, KeyPick:Add, Text, x10 y10 w380 Center, %titleText%
+    Gui, KeyPick:Add, Edit, x25 y35 vKeyList w350 r5 ReadOnly
+    Gui, KeyPick:Add, Text, x25 y135, Interval (ms):
+    Gui, KeyPick:Add, Edit, x105 y130 vGroupInterval w60, %DefaultInterval%
+    Gui, KeyPick:Add, Button, x25 y160 gConfirmKeys, Confirm Selection
+    Gui, KeyPick:Add, Button, x+10 gClearKeys -Tabstop, Clear buttons
+    Gui, KeyPick:Add, Button, x+10 gAddAnotherGroup -Tabstop, Add Another Group
+    Gui, KeyPick:Show, w400 h200, Key Selection
     KeysArray := ""
     SetTimer, ChooseHoldDetectTimer, Off
     SetTimer, ChooseMouseHoldDetectTimer, Off
@@ -215,9 +263,16 @@ ChooseKeys:
     ChooseHoldWaitUpMouse := 0
     OnMessage(0x100, "KeyDownMsg")
     OnMessage(0x101, "KeyUpMsg")
+    KeyPickRefreshList()
+    KeyPickFocusKeyList()
 Return
 
 GuiClose:
+    ExitApp
+Return
+
+; Закрытие только окна выбора клавиш (без глобального OnMessage 0x112 на все окна скрипта)
+KeyPickGuiClose:
     ExitApp
 Return
 
@@ -229,24 +284,43 @@ ClearKeys:
     ChooseHoldWaitUpVk := 0
     ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
     ChooseHoldWaitUpMouse := 0
-    GuiControl,, KeyList
+    KeyPickRefreshList()
+    KeyPickFocusKeyList()
 Return
 
 ConfirmKeys:
-    IsChoosingKeys := False
+    Global MouseCoordExitReason
+    Gui, KeyPick:Default
+    ChooseFlushKeyboardPendingIfAny()
+    ChooseFlushMousePendingIfAny()
     OnMessage(0x100, False), OnMessage(0x101, False)
-    Gui, Submit, NoHide
     SetTimer, ChooseHoldDetectTimer, Off
     SetTimer, ChooseMouseHoldDetectTimer, Off
     ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
     ChooseHoldWaitUpVk := 0
     ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
     ChooseHoldWaitUpMouse := 0
-    GoSub ReEnterPID
+    Gui, KeyPick:Submit, NoHide
+    IsChoosingKeys := False
+    Gui, KeyPick:Hide
+    SaveCurrentGroup()
+    PendingGroupForTargets := TotalGroups
+    Gosub, PromptTargetsIntoGroup
+    if (!LastPromptTargetsOk)
+        Return
+    Gosub, PromptMouseCoordsForGroup
+    if (MouseCoordExitReason = 1) {
+        Gosub, CancelMouseCoordWizardReturnToKeyPick
+        Return
+    }
+    Gosub, FinishSetupAfterTargets
 Return
 
 AddAnotherGroup:
-    IsChoosingKeys := False
+    Global MouseCoordExitReason
+    Gui, KeyPick:Default
+    ChooseFlushKeyboardPendingIfAny()
+    ChooseFlushMousePendingIfAny()
     OnMessage(0x100, False), OnMessage(0x101, False)
     SetTimer, ChooseHoldDetectTimer, Off
     SetTimer, ChooseMouseHoldDetectTimer, Off
@@ -254,8 +328,19 @@ AddAnotherGroup:
     ChooseHoldWaitUpVk := 0
     ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
     ChooseHoldWaitUpMouse := 0
-    Gui, Submit, NoHide
+    Gui, KeyPick:Submit, NoHide
+    IsChoosingKeys := False
+    Gui, KeyPick:Hide
     SaveCurrentGroup()
+    PendingGroupForTargets := TotalGroups
+    Gosub, PromptTargetsIntoGroup
+    if (!LastPromptTargetsOk)
+        Return
+    Gosub, PromptMouseCoordsForGroup
+    if (MouseCoordExitReason = 1) {
+        Gosub, CancelMouseCoordWizardReturnToKeyPick
+        Return
+    }
     CurrentGroup += 1
     GoSub, ChooseKeys
 Return
@@ -264,6 +349,8 @@ SaveCurrentGroup() {
     Global KeysArray, GroupInterval, DefaultInterval, Groups, TotalGroups
     Group := {}
     Group.keys := KeysArray
+    Group.mouseClickFixed := false
+    Group.mouseClickNoMove := false
     gi := Trim(GroupInterval)
     if (gi = "")
         Group.interval := DefaultInterval
@@ -273,20 +360,44 @@ SaveCurrentGroup() {
     TotalGroups += 1
 }
 
-; === Ввод PID / ProcessName ===
-ReEnterPID:
-    SetMainHotkeys("Off")
+GroupsConfigured() {
+    Global Groups, TotalGroups
+    if (TotalGroups < 1)
+        return false
+    Loop % TotalGroups {
+        g := Groups[A_Index]
+        if (!IsObject(g))
+            return false
+        tgt := g.tgtHwnds
+        if (!IsObject(tgt) || tgt.Length() < 1)
+            return false
+    }
+    return true
+}
+
+PromptTargetsIntoGroup:
+    Global Groups, PendingGroupForTargets, TotalGroups, TotalProcesses, TargetPIDArray, TargetProcessArray, TargetHwndArray
+    Global ProcessInputBoxW, ProcessInputBoxH
+    LastPromptTargetsOk := false
+    gi := PendingGroupForTargets
+    if (gi < 1 || gi > TotalGroups)
+        Return
     Loop {
         TargetPIDArray := [], TargetProcessArray := [], TargetHwndArray := []
         TotalProcesses := 0
-        promptText := "Enter PID or process name.`n`n"
+        promptText := "Group " . gi . " — targets only for this group.`n`n"
+        promptText .= "PID or process name.`n`n"
         promptText .= "Example.`n"
         promptText .= "PID:[1234 5678][1234.5678].`n"
         promptText .= "Name:[notepad explorer][notepad.explorer]."
 
-        InputBox, TargetInput, Enter Process Info, %promptText%,
+        ibW := ProcessInputBoxW + 0
+        ibH := ProcessInputBoxH + 0
+        InputBox, TargetInput, Enter Process Info, %promptText%, , %ibW%, %ibH%
         If ErrorLevel {
-            GoSub, ChooseKeys
+            Groups.RemoveAt(TotalGroups)
+            TotalGroups -= 1
+            Gosub, ChooseKeys
             Return
         }
 
@@ -370,67 +481,267 @@ ReEnterPID:
         }
         Break
     }
+    g := Groups[gi]
+    g.tgtHwnds := []
+    g.tgtPids := []
+    g.tgtProcs := []
+    Loop % TotalProcesses {
+        g.tgtHwnds.Push(TargetHwndArray[A_Index])
+        g.tgtPids.Push(TargetPIDArray[A_Index])
+        g.tgtProcs.Push(TargetProcessArray[A_Index])
+    }
+    LastPromptTargetsOk := true
+Return
 
+CancelMouseCoordWizardReturnToKeyPick:
+    Global Groups, TotalGroups, KeysArray, GroupInterval, KeyPickHwnd, MouseCoordExitReason
+    Global IsChoosingKeys, ChoosePendingVk, ChoosePendingToken, ChoosePendingStart, ChooseHoldWaitUpVk
+    Global ChoosePendingMouseBtn, ChoosePendingMouseToken, ChoosePendingMouseStart, ChooseHoldWaitUpMouse
+    if (TotalGroups < 1) {
+        MouseCoordExitReason := 0
+        Return
+    }
+    g := Groups[TotalGroups]
+    KeysArray := g.keys
+    GroupInterval := g.interval
+    Groups.RemoveAt(TotalGroups)
+    TotalGroups -= 1
+    MouseCoordExitReason := 0
+    ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
+    ChooseHoldWaitUpVk := 0
+    ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
+    ChooseHoldWaitUpMouse := 0
+    SetTimer, ChooseHoldDetectTimer, Off
+    SetTimer, ChooseMouseHoldDetectTimer, Off
+    IsChoosingKeys := True
+    OnMessage(0x100, "KeyDownMsg")
+    OnMessage(0x101, "KeyUpMsg")
+    if (!KeyPickHwnd || !WinExist("ahk_id " . KeyPickHwnd)) {
+        Gosub, ChooseKeys
+        Return
+    }
+    Gui, KeyPick:Default
+    GuiControl,, GroupInterval, %GroupInterval%
+    KeyPickRefreshList()
+    Gui, KeyPick:Show, w400 h200, Key Selection
+    KeyPickFocusKeyList()
+Return
+
+PromptMouseCoordsForGroup:
+    Global Groups, TotalGroups, MouseCoordPendingGi, MouseCoordModalResult, MouseCoordExitReason
+    MouseCoordExitReason := 0
+    MouseCoordPendingGi := TotalGroups
+    if (MouseCoordPendingGi < 1 || MouseCoordPendingGi > Groups.Length())
+        Return
+    g := Groups[MouseCoordPendingGi]
+    if (!GroupKeysNeedMouse(g.keys))
+        Return
+    if (!IsObject(g.tgtHwnds) || g.tgtHwnds.Length() < 1)
+        Return
+    MouseCoordModalResult := 0
+    Gosub, ShowMouseCoordGuiModal
+Return
+
+ShowMouseCoordGuiModal:
+    Global Groups, MouseCoordPendingGi, MccPickHw, MouseCoordModalResult, KeyPickHwnd, MouseCoordExitReason
+    hRef := (Groups[MouseCoordPendingGi].tgtHwnds[1]) + 0
+    root := KeyTargetGameRoot(hRef)
+    if (!root) {
+        MouseCoordExitReason := 3
+        MouseCoordModalResult := 1
+        Return
+    }
+    MccPickHw := 0
+    Gui, MouseCoordPick:New, +HwndMccPickHw +AlwaysOnTop +LabelMouseCoordPick
+    Gui, MouseCoordPick:Margin, 8, 8
+    Gui, MouseCoordPick:Font, s8
+    Gui, MouseCoordPick:Add, Text, xm w360, Click = client coords of target window root.`nLive / Click follow the cursor until "Manual entry" is checked.
+    Gui, MouseCoordPick:Add, Checkbox, xm y+8 vMcManual, Manual entry
+    Gui, MouseCoordPick:Add, Checkbox, xm y+6 vMcNoMove, WM: click without moving system cursor (fixed coords OR window center; game must honor WM)
+    Gui, MouseCoordPick:Add, Text, xm y+8 section w44, Live X
+    Gui, MouseCoordPick:Add, Text, vMcLiveXM w78 ys, 0
+    Gui, MouseCoordPick:Add, Text, x+10 ys w44, Live Y
+    Gui, MouseCoordPick:Add, Text, vMcLiveYM ys w78, 0
+    Gui, MouseCoordPick:Add, Text, xm y+10 section w44, Click X
+    Gui, MouseCoordPick:Add, Edit, vMcSetX w78 ys, 0
+    Gui, MouseCoordPick:Add, Text, x+10 ys w44, Click Y
+    Gui, MouseCoordPick:Add, Edit, vMcSetY ys w78, 0
+    Gui, MouseCoordPick:Add, Button, xm y+10 w72 h22 gMouseCoordGuiOK, OK
+    Gui, MouseCoordPick:Add, Button, x+8 yp w200 h22 gMouseCoordGuiSkip, Default (cursor / center)
+    Gui, MouseCoordPick:Show, AutoSize Center, Mouse click coordinates
+    Gui, MouseCoordPick:+HwndMccPickHw
+    SetTimer, MouseCoordLiveTimer, 50
+    Gosub, MouseCoordLiveTimer
+    While (MouseCoordModalResult = 0) {
+        if (MccPickHw && !WinExist("ahk_id " . MccPickHw)) {
+            MouseCoordModalResult := 1
+            if (MouseCoordExitReason = 0)
+                MouseCoordExitReason := 1
+            Break
+        }
+        Sleep, 10
+    }
+    SetTimer, MouseCoordLiveTimer, Off
+    if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd))
+        Gui, KeyPick:Default
+Return
+
+MouseCoordLiveTimer:
+    Global Groups, MouseCoordPendingGi, MccPickHw, KeyPickHwnd
+    if (!MccPickHw || !WinExist("ahk_id " . MccPickHw))
+        Return
+    Gui, MouseCoordPick:Default
+    gi := MouseCoordPendingGi
+    if (gi < 1 || gi > Groups.Length()) {
+        if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd))
+            Gui, KeyPick:Default
+        Return
+    }
+    g := Groups[gi]
+    if (!IsObject(g.tgtHwnds) || g.tgtHwnds.Length() < 1) {
+        if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd))
+            Gui, KeyPick:Default
+        Return
+    }
+    hRef := g.tgtHwnds[1] + 0
+    root := KeyTargetGameRoot(hRef)
+    if (!root) {
+        if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd))
+            Gui, KeyPick:Default
+        Return
+    }
+    CoordMode, Mouse, Screen
+    MouseGetPos, mcx, mcy
+    VarSetCapacity(pt, 8, 0)
+    NumPut(mcx, pt, 0, "Int")
+    NumPut(mcy, pt, 4, "Int")
+    if (DllCall("user32\ScreenToClient", "UPtr", root, "Ptr", &pt)) {
+        cx := NumGet(pt, 0, "Int")
+        cy := NumGet(pt, 4, "Int")
+        GuiControl,, McLiveXM, %cx%
+        GuiControl,, McLiveYM, %cy%
+        GuiControlGet, mcMan,, McManual
+        if ((mcMan + 0) = 0) {
+            GuiControl,, McSetX, %cx%
+            GuiControl,, McSetY, %cy%
+        }
+    }
+    if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd))
+        Gui, KeyPick:Default
+Return
+
+MouseCoordGuiOK:
+    SetTimer, MouseCoordLiveTimer, Off
+    Global Groups, MouseCoordPendingGi, MccPickHw, MouseCoordModalResult, KeyPickHwnd, MouseCoordExitReason
+    MouseCoordExitReason := 2
+    MouseCoordModalResult := 1
+    Gui, MouseCoordPick:Submit, NoHide
+    gi := MouseCoordPendingGi
+    if (gi >= 1 && gi <= Groups.Length()) {
+        g := Groups[gi]
+        g.mouseClickFixed := true
+        g.mouseClientX := McSetX + 0
+        g.mouseClientY := McSetY + 0
+        GuiControlGet, mcnm,, McNoMove
+        g.mouseClickNoMove := (mcnm + 0) != 0
+    }
+    Gui, MouseCoordPick:Destroy
+    MccPickHw := 0
+    if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd))
+        Gui, KeyPick:Default
+Return
+
+MouseCoordGuiSkip:
+    SetTimer, MouseCoordLiveTimer, Off
+    Global Groups, MouseCoordPendingGi, MccPickHw, MouseCoordModalResult, KeyPickHwnd, MouseCoordExitReason
+    MouseCoordExitReason := 3
+    MouseCoordModalResult := 1
+    gi := MouseCoordPendingGi
+    if (gi >= 1 && gi <= Groups.Length()) {
+        g := Groups[gi]
+        g.mouseClickFixed := false
+        Gui, MouseCoordPick:Default
+        GuiControlGet, mcnm,, McNoMove
+        g.mouseClickNoMove := (mcnm + 0) != 0
+    }
+    Gui, MouseCoordPick:Destroy
+    MccPickHw := 0
+    if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd))
+        Gui, KeyPick:Default
+Return
+
+MouseCoordPickGuiClose:
+MouseCoordPickGuiEscape:
+    Global Groups, MouseCoordPendingGi, MccPickHw, MouseCoordModalResult, KeyPickHwnd, MouseCoordExitReason
+    SetTimer, MouseCoordLiveTimer, Off
+    alreadyDone := (MouseCoordModalResult != 0)
+    if (!alreadyDone) {
+        MouseCoordExitReason := 1
+        MouseCoordModalResult := 1
+    }
+    if (MccPickHw && WinExist("ahk_id " . MccPickHw)) {
+        if (!alreadyDone) {
+            gi := MouseCoordPendingGi
+            if (gi >= 1 && gi <= Groups.Length()) {
+                g := Groups[gi]
+                g.mouseClickFixed := false
+                g.mouseClickNoMove := false
+            }
+        }
+        Gui, MouseCoordPick:Destroy
+    }
+    MccPickHw := 0
+    if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd))
+        Gui, KeyPick:Default
+Return
+
+FinishSetupAfterTargets:
+    Global StatusBarHwnd, KeyPickHwnd
     IsChoosingKeys := False
-    SaveCurrentGroup()
-
-; === GUI статуса ===
+    Gui, KeyPick:Destroy
+    KeyPickHwnd := 0
     Gui, Destroy
-    Gui, +AlwaysOnTop +ToolWindow -Caption +LastFound
-    Gui, Color, 1E1E1E
-    Gui, Font, s10 cRed, Consolas
+    if (StatusBarHwnd && WinExist("ahk_id " . StatusBarHwnd)) {
+        Gui, StatusBar:Destroy
+        StatusBarHwnd := 0
+    }
+    Gui, StatusBar:New, +AlwaysOnTop +ToolWindow -Caption +HwndStatusBarHwnd
+    Gui, StatusBar:Color, 1E1E1E
+    Gui, StatusBar:Font, s%StatusFontSize% cRed, Consolas
     fullStatus := BuildStatusText("OFF")
     borderOnly := BuildBorderMask(fullStatus)
     innerStatus := BuildInnerStatusText(fullStatus)
-    Gui, Add, Text, vStatusBorder, %borderOnly%
-    Gui, Add, Text, xp yp vStatus BackgroundTrans, %innerStatus%
-    if (ShowStatusGUI)
-        Gui, Show, x%StatusPosX% y%StatusPosY% NoActivate AutoSize, Multi-PID Control
+    Gui, StatusBar:Add, Text, vStatusBorder, %borderOnly%
+    Gui, StatusBar:Add, Text, xp yp vStatus BackgroundTrans, %innerStatus%
+    if (ShowStatusGUI) {
+        statusGuiX := StatusPosX + 0
+        statusGuiY := StatusPosY + 0
+        Gui, StatusBar:Show, x%statusGuiX% y%statusGuiY% NoActivate AutoSize, Multi-PID Control
+    }
     InitIndicator()
     SetMainHotkeys("On")
 Return
 
 ; === Обновление статуса ===
+TruncateStatusLine(s, maxC) {
+    if (maxC < 4)
+        return SubStr(s, 1, maxC)
+    if (StrLen(s) <= maxC)
+        return s
+    return SubStr(s, 1, maxC - 3) . "..."
+}
+
 BuildStatusText(statusMode) {
-    Global Groups, TotalGroups, TargetProcessArray, TotalProcesses, TargetPIDArray, KeyDelay, UseSimulation
-    statusText := "Status: " statusMode
-    baseStatus := "Status: ACTIVE (LOCKED)"
-    maxLen := StrLen(baseStatus)
-    Loop %TotalGroups% {
-        keys := Groups[A_Index].keys
-        if (!RegExMatch(keys, "^\{.*\}$"))
-            keys := "{" keys "}"
-        keysForCount := Groups[A_Index].keys
-        StringSplit, keyArray, keysForCount, %A_Space%
-        totalDelay := (keyArray0 - 1) * KeyDelay
-        realInterval := Groups[A_Index].interval + totalDelay
-        keyText := "G" A_Index ": " keys " (" realInterval "ms)"
-        if (StrLen(keyText) > maxLen)
-            maxLen := StrLen(keyText)
-    }
-    if (TotalProcesses > 0) {
-        Loop %TotalProcesses% {
-            processText := "PID: " Trim(TargetPIDArray[A_Index]) " (" Trim(TargetProcessArray[A_Index]) ")"
-            if (StrLen(processText) > maxLen)
-                maxLen := StrLen(processText)
-        }
-    }
-    modePlain := UseSimulation ? "Mode: CtrlSend" : "Mode: WM post"
+    Global Groups, TotalGroups, KeyDelay, UseSimulation, StatusGuiMaxChars
+    mc := StatusGuiMaxChars
+    statusText := TruncateStatusLine("Status: " statusMode, mc)
+    modePlain := TruncateStatusLine(UseSimulation ? "Mode: CtrlSend" : "Mode: WM post", mc)
+    maxLen := StrLen(statusText)
     if (StrLen(modePlain) > maxLen)
         maxLen := StrLen(modePlain)
-    paddingLen := maxLen + 2
-    border := "+"
-    Loop %paddingLen%
-        border .= "-"
-    border .= "+"
-    statusPadding := ""
-    Loop % (maxLen - StrLen(statusText))
-        statusPadding .= " "
-    fullStatus := border . "`n| " statusText statusPadding " |`n"
-    modePad := ""
-    Loop % (maxLen - StrLen(modePlain))
-        modePad .= " "
-    fullStatus .= "| " modePlain modePad " |`n"
+    lines := []
+    lines.Push(statusText)
+    lines.Push(modePlain)
     Loop %TotalGroups% {
         keys := Groups[A_Index].keys
         if (!RegExMatch(keys, "^\{.*\}$"))
@@ -439,27 +750,45 @@ BuildStatusText(statusMode) {
         StringSplit, keyArray, keysForCount, %A_Space%
         totalDelay := (keyArray0 - 1) * KeyDelay
         realInterval := Groups[A_Index].interval + totalDelay
-        keyText := "G" A_Index ": " keys " (" realInterval "ms)"
-        padding := ""
-        Loop % (maxLen - StrLen(keyText))
-            padding .= " "
-        fullStatus .= "| " keyText padding " |"
-        If (A_Index < TotalGroups)
-            fullStatus .= "`n"
-    }
-    if (TotalProcesses > 0) {
-        fullStatus .= "`n" . border . "`n"
-        Loop %TotalProcesses% {
-            processText := "PID: " Trim(TargetPIDArray[A_Index]) " (" Trim(TargetProcessArray[A_Index]) ")"
-            processPadding := ""
-            Loop % (maxLen - StrLen(processText))
-                processPadding .= " "
-            fullStatus .= "| " processText processPadding " |"
-            If (A_Index < TotalProcesses)
-                fullStatus .= "`n"
+        tgtStr := ""
+        gp := Groups[A_Index].tgtPids
+        gpr := Groups[A_Index].tgtProcs
+        if (IsObject(gp) && gp.Length() > 0) {
+            Loop % gp.Length() {
+                tgtStr .= (tgtStr ? ", " : "") . "PID " . Trim(gp[A_Index]) . " (" . Trim(gpr[A_Index]) . ")"
+            }
+        }
+        head := "G" A_Index ": " keys " (" realInterval "ms)"
+        if (Groups[A_Index].mouseClickFixed)
+            head .= " [mouse " . Groups[A_Index].mouseClientX . "," . Groups[A_Index].mouseClientY . "]"
+        if (Groups[A_Index].mouseClickNoMove)
+            head .= " [WM no-cursor]"
+        line1 := TruncateStatusLine(head, mc)
+        lines.Push(line1)
+        if (StrLen(line1) > maxLen)
+            maxLen := StrLen(line1)
+        if (tgtStr != "") {
+            line2 := TruncateStatusLine(tgtStr, mc)
+            lines.Push(line2)
+            if (StrLen(line2) > maxLen)
+                maxLen := StrLen(line2)
         }
     }
-    Return fullStatus . "`n" . border
+    if (maxLen < 18)
+        maxLen := 18
+    border := "+"
+    Loop % (maxLen + 2)
+        border .= "-"
+    border .= "+"
+    fullStatus := border . "`n"
+    Loop % lines.MaxIndex() {
+        ln := lines[A_Index]
+        pad := ""
+        Loop % (maxLen - StrLen(ln))
+            pad .= " "
+        fullStatus .= "| " ln pad " |`n"
+    }
+    Return RTrim(fullStatus, "`r`n") . "`n" . border
 }
 
 BuildInnerStatusText(fullStatus) {
@@ -523,8 +852,10 @@ BuildBorderMask(fullStatus) {
 }
 
 UpdateStatus() {
-    Global Toggle, ShowStatusGUI, GlobalBindsDisabled
+    Global Toggle, ShowStatusGUI, GlobalBindsDisabled, StatusBarHwnd
     if (!ShowStatusGUI)
+        Return
+    if (!StatusBarHwnd || !WinExist("ahk_id " . StatusBarHwnd))
         Return
     if (GlobalBindsDisabled) {
         mode := Toggle ? "ACTIVE (LOCKED)" : "OFF (LOCKED)"
@@ -536,10 +867,10 @@ UpdateStatus() {
     fullStatus := BuildStatusText(mode)
     borderOnly := BuildBorderMask(fullStatus)
     innerStatusText := BuildInnerStatusText(fullStatus)
-    GuiControl, +c%borderColor%, StatusBorder
-    GuiControl, +c%innerColor%, Status
-    GuiControl,, StatusBorder, %borderOnly%
-    GuiControl,, Status, %innerStatusText%
+    GuiControl, StatusBar:+c%borderColor%, StatusBorder
+    GuiControl, StatusBar:+c%innerColor%, Status
+    GuiControl, StatusBar:, StatusBorder, %borderOnly%
+    GuiControl, StatusBar:, Status, %innerStatusText%
 }
 
 InitIndicator() {
@@ -635,34 +966,47 @@ ToggleDeferredSendGroups:
 Return
 
 ToggleAction:
-    if (IsChoosingKeys || TotalProcesses = 0 || TotalGroups = 0) {
+    if (IsChoosingKeys || !GroupsConfigured()) {
         Return
     }
     Toggle := !Toggle
     if (!Toggle) {
-        ReleaseAllHeldInfinite()
         SetTimer, ToggleDeferredSendGroups, Off
-    }
-    UpdateStatus()
-    UpdateIndicator()
-    Loop % TotalGroups {
-        If (Toggle) {
-            SetTimer, % "SendGroup" . A_Index, % Groups[A_Index].interval
-        } Else {
+        Loop % TotalGroups {
             SetTimer, % "SendGroup" . A_Index, Off
         }
-    }
-    if (Toggle)
+        ; Сначала обновляем статус/индикатор, затем тяжёлое снятие удержаний — иначе GUI «отстаёт»
+        UpdateStatus()
+        UpdateIndicator()
+        ReleaseAllHeldInfinite()
+    } else {
+        UpdateStatus()
+        UpdateIndicator()
+        Loop % TotalGroups {
+            SetTimer, % "SendGroup" . A_Index, % Groups[A_Index].interval
+        }
         SetTimer, ToggleDeferredSendGroups, -1
+    }
 Return
 
 ; === Подпрограмма: перенастройка клавиш ===
 RechooseKeys:
-    If (IsChoosingKeys) {
-        MsgBox, Finish key selection first.
-        Return
-    }
     ReleaseAllHeldInfinite()
+    if (IsChoosingKeys) {
+        OnMessage(0x100, False), OnMessage(0x101, False)
+        SetTimer, ChooseHoldDetectTimer, Off
+        SetTimer, ChooseMouseHoldDetectTimer, Off
+        ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
+        ChooseHoldWaitUpVk := 0
+        ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
+        ChooseHoldWaitUpMouse := 0
+        Global KeyPickHwnd
+        if (KeyPickHwnd && WinExist("ahk_id " . KeyPickHwnd)) {
+            Gui, KeyPick:Destroy
+            KeyPickHwnd := 0
+        }
+        IsChoosingKeys := False
+    }
     Loop % TotalGroups
         SetTimer, % "SendGroup" . A_Index, Off
     Groups := [], TotalGroups := 0, CurrentGroup := 1
@@ -670,22 +1014,23 @@ RechooseKeys:
     Toggle := False
     UpdateStatus()
     UpdateIndicator()
-    SetMainHotkeys("Off")
     GoSub, ChooseKeys
 Return
 
 ; === Подпрограмма: переключение показа/скрытия GUI статуса ===
 ToggleStatusGUI:
-    If (IsChoosingKeys || TotalProcesses = 0)
+    If (!GroupsConfigured())
         Return
     If (ShowStatusGUI := !ShowStatusGUI)
     {
-        Gui, Show, NoActivate
+        statusGuiX := StatusPosX + 0
+        statusGuiY := StatusPosY + 0
+        Gui, StatusBar:Show, x%statusGuiX% y%statusGuiY% NoActivate AutoSize
         UpdateStatus()
     }
     Else
     {
-        Gui, Hide
+        Gui, StatusBar:Hide
     }
 Return
 
@@ -796,7 +1141,7 @@ SendKeyspec_SimDown(h, keyspec) {
         return
     }
     if (RegExMatch(mainK, "i)^(LButton|RButton)$")) {
-        ResolveClickClientCoords(h, mcX, mcY)
+        ResolveGroupClickClientCoords(h, true, mcX, mcY)
         btnLr := InStr(mainK, "R") ? "Right" : "Left"
         ControlClick, x%mcX% y%mcY%, ahk_id %h%,, %btnLr%, 1, NA D
         return
@@ -825,7 +1170,7 @@ SendKeyspec_SimUp(h, keyspec) {
         return
     }
     if (RegExMatch(mainK, "i)^(LButton|RButton)$")) {
-        ResolveClickClientCoords(h, mcX, mcY)
+        ResolveGroupClickClientCoords(h, true, mcX, mcY)
         btnLr := InStr(mainK, "R") ? "Right" : "Left"
         ControlClick, x%mcX% y%mcY%, ahk_id %h%,, %btnLr%, 1, NA U
         return
@@ -855,13 +1200,14 @@ SendKeyspec_PostDown(h, keyspec) {
         return
     }
     if (RegExMatch(mainK, "i)^(LButton|RButton)$")) {
-        ResolveClickClientCoords(h, mcX, mcY)
+        ResolveGroupClickClientCoords(h, false, mcX, mcY)
+        PostWmMouseSnapBegin(h, mcX, mcY)
         lPar := ((mcY & 0xFFFF) << 16) | (mcX & 0xFFFF)
-        PostMsgToFocus(h, 0x200, 0, lPar)
+        SendMsgToFocus(h, 0x200, 0, lPar)
         if (RegExMatch(mainK, "i)^RButton$"))
-            PostMsgToFocus(h, 0x204, 2, lPar)
+            SendMsgToFocus(h, 0x204, 2, lPar)
         else
-            PostMsgToFocus(h, 0x201, 1, lPar)
+            SendMsgToFocus(h, 0x201, 1, lPar)
         return
     }
     if (StrLen(mainK) = 1 && mainK != " ") {
@@ -901,12 +1247,26 @@ SendKeyspec_PostUp(h, keyspec) {
         return
     }
     if (RegExMatch(mainK, "i)^(LButton|RButton)$")) {
-        ResolveClickClientCoords(h, mcX, mcY)
+        Global SendGroup_MouseNoMove
+        ResolveGroupClickClientCoords(h, false, mcX, mcY)
+        if (SendGroup_MouseNoMove) {
+            lPar := ((mcY & 0xFFFF) << 16) | (mcX & 0xFFFF)
+            if (RegExMatch(mainK, "i)^RButton$"))
+                SendMsgToFocus(h, 0x205, 0, lPar)
+            else
+                SendMsgToFocus(h, 0x202, 0, lPar)
+            Sleep, 0
+            PostWmMouseSnapEnd()
+            return
+        }
+        PostWmMouseMoveCursorToRootClient(h, mcX, mcY)
         lPar := ((mcY & 0xFFFF) << 16) | (mcX & 0xFFFF)
         if (RegExMatch(mainK, "i)^RButton$"))
-            PostMsgToFocus(h, 0x205, 0, lPar)
+            SendMsgToFocus(h, 0x205, 0, lPar)
         else
-            PostMsgToFocus(h, 0x202, 0, lPar)
+            SendMsgToFocus(h, 0x202, 0, lPar)
+        Sleep, 0
+        PostWmMouseSnapEnd()
         return
     }
     if (StrLen(mainK) = 1 && mainK != " ") {
@@ -934,20 +1294,32 @@ SendKeyspec_PostUp(h, keyspec) {
 }
 
 ReleaseAllHeldInfinite() {
-    Global HeldInfinite, TotalProcesses, TargetHwndArray
-    if (!HeldInfinite.Length())
-        return
-    Loop % HeldInfinite.Length() {
-        e := HeldInfinite[A_Index]
-        Loop %TotalProcesses% {
-            h := TargetHwndArray[A_Index]
-            if (e.s)
-                SendKeyspec_SimUp(h, e.k)
-            else
-                SendKeyspec_PostUp(h, e.k)
+    Global HeldInfinite, SendGroup_MouseFixed, SendGroup_MouseCX, SendGroup_MouseCY, SendGroup_MouseNoMove
+    if (HeldInfinite.Length()) {
+        prevF := SendGroup_MouseFixed, prevX := SendGroup_MouseCX, prevY := SendGroup_MouseCY, prevNM := SendGroup_MouseNoMove
+        Loop % HeldInfinite.Length() {
+            e := HeldInfinite[A_Index]
+            SendGroup_MouseFixed := e.mouseFixed
+            SendGroup_MouseCX := e.mouseCX
+            SendGroup_MouseCY := e.mouseCY
+            SendGroup_MouseNoMove := e.mouseNoMove ? true : false
+            if (IsObject(e.h)) {
+                Loop % e.h.Length() {
+                    h := e.h[A_Index]
+                    if (e.s)
+                        SendKeyspec_SimUp(h, e.k)
+                    else
+                        SendKeyspec_PostUp(h, e.k)
+                }
+            }
         }
+        SendGroup_MouseFixed := prevF
+        SendGroup_MouseCX := prevX
+        SendGroup_MouseCY := prevY
+        SendGroup_MouseNoMove := prevNM
+        HeldInfinite := []
     }
-    HeldInfinite := []
+    PostWmMouseSnapResetIfAny()
 }
 
 VkToHex(vk) {
@@ -962,6 +1334,14 @@ VkToHex(vk) {
     return h
 }
 
+SnapshotExecHwnds() {
+    Global SendGroup_ExecHwnds, SendGroup_ExecN
+    a := []
+    Loop % SendGroup_ExecN
+        a.Push(SendGroup_ExecHwnds[A_Index])
+    return a
+}
+
 ; === Отправка клавиш для групп ===
 SendGroup1:
 SendGroup2:
@@ -974,20 +1354,43 @@ Return
 
 ; === Отправка клавиш ===
 SendGroupKeys(groupIndex) {
-    Global Groups, TotalProcesses, TargetHwndArray, KeyDelay, UseSimulation, Toggle
+    Global Groups, KeyDelay, UseSimulation, Toggle, SendGroup_ExecHwnds, SendGroup_ExecN
+    Global SendGroup_MouseFixed, SendGroup_MouseCX, SendGroup_MouseCY, SendGroup_MouseNoMove
     if (groupIndex > Groups.Length() || !Toggle)
         Return
-    keysToSend := Groups[groupIndex].keys
-    keysArray := ParseKeys(keysToSend)
+    g := Groups[groupIndex]
+    if (!IsObject(g.tgtHwnds) || g.tgtHwnds.Length() < 1)
+        Return
+    SendGroup_ExecHwnds := g.tgtHwnds
+    SendGroup_ExecN := g.tgtHwnds.Length()
+    SendGroup_MouseFixed := false
+    SendGroup_MouseCX := ""
+    SendGroup_MouseCY := ""
+    SendGroup_MouseNoMove := g.mouseClickNoMove ? true : false
+    if (g.mouseClickFixed) {
+        SendGroup_MouseFixed := true
+        SendGroup_MouseCX := g.mouseClientX + 0
+        SendGroup_MouseCY := g.mouseClientY + 0
+    }
+    keysArray := ParseKeys(g.keys)
     If UseSimulation {
         SendGroupKeys_Simulated(keysArray)
+        SendGroup_MouseFixed := false
+        SendGroup_MouseCX := ""
+        SendGroup_MouseCY := ""
+        SendGroup_MouseNoMove := false
         Return
     }
     SendGroupKeys_Posted(keysArray)
+    SendGroup_MouseFixed := false
+    SendGroup_MouseCX := ""
+    SendGroup_MouseCY := ""
+    SendGroup_MouseNoMove := false
 }
 
 SendGroupKeys_Simulated(keysArray) {
-    Global Toggle, TotalProcesses, TargetHwndArray, KeyDelay
+    Global Toggle, SendGroup_ExecHwnds, SendGroup_ExecN, KeyDelay
+    Global SendGroup_MouseFixed, SendGroup_MouseCX, SendGroup_MouseCY, SendGroup_MouseNoMove
     Loop % keysArray.Length()
     {
         If (!Toggle)
@@ -998,33 +1401,33 @@ SendGroupKeys_Simulated(keysArray) {
                 Return
             holdMs := hm1 + 0
             keyspec := hm2
-            Global HeldInfinite, TotalProcesses, TargetHwndArray, KeyDelay
-            Loop %TotalProcesses% {
-                hW := TargetHwndArray[A_Index]
+            Global HeldInfinite, KeyDelay
+            Loop %SendGroup_ExecN% {
+                hW := SendGroup_ExecHwnds[A_Index]
                 SendKeyspec_SimDown(hW, keyspec)
             }
             if (holdMs > 0) {
                 Sleep, %holdMs%
                 if (!Toggle) {
-                    Loop %TotalProcesses% {
-                        SendKeyspec_SimUp(TargetHwndArray[A_Index], keyspec)
+                    Loop %SendGroup_ExecN% {
+                        SendKeyspec_SimUp(SendGroup_ExecHwnds[A_Index], keyspec)
                     }
                     Return
                 }
-                Loop %TotalProcesses% {
-                    SendKeyspec_SimUp(TargetHwndArray[A_Index], keyspec)
+                Loop %SendGroup_ExecN% {
+                    SendKeyspec_SimUp(SendGroup_ExecHwnds[A_Index], keyspec)
                 }
             } else {
-                HeldInfinite.Push({s: 1, k: keyspec})
+                HeldInfinite.Push({s: 1, k: keyspec, h: SnapshotExecHwnds(), mouseFixed: SendGroup_MouseFixed, mouseCX: SendGroup_MouseCX, mouseCY: SendGroup_MouseCY, mouseNoMove: SendGroup_MouseNoMove})
             }
             Sleep, %KeyDelay%
             Continue
         }
         If (RegExMatch(currentKey, "i)^\{(LButton|LClick|Click)\}$"))
         {
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 SendLeftClickAtCursor(hWndTarget, True)
             }
             Sleep, %KeyDelay%
@@ -1032,9 +1435,9 @@ SendGroupKeys_Simulated(keysArray) {
         }
         If (RegExMatch(currentKey, "i)^\{(RButton|RClick)\}$"))
         {
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 SendRightClickAtCursor(hWndTarget, True)
             }
             Sleep, %KeyDelay%
@@ -1042,9 +1445,9 @@ SendGroupKeys_Simulated(keysArray) {
         }
         If (RegExMatch(currentKey, "i)^\{Space\}$"))
         {
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 ControlSend, , {Space}, ahk_id %hWndTarget%
             }
             Sleep, %KeyDelay%
@@ -1072,9 +1475,9 @@ SendGroupKeys_Simulated(keysArray) {
             sendFormat := RegExReplace(sendFormat, "i)\{LWin\+", "#")
             sendFormat := RegExReplace(sendFormat, "i)\{RWin\+", "#")
             sendFormat := RegExReplace(sendFormat, "\}", "")
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 If (StrLen(mainKey) = 1)
                 {
                     ksMod := "{Raw}" . sendFormat
@@ -1088,18 +1491,18 @@ SendGroupKeys_Simulated(keysArray) {
         }
         Else If (StrLen(keyStr) = 1 && keyStr != " ")
         {
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 ksOne := "{Text}" . keyStr
                 ControlSend, , %ksOne%, ahk_id %hWndTarget%
             }
         }
         Else
         {
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 ControlSend, , %currentKey%, ahk_id %hWndTarget%
             }
         }
@@ -1108,7 +1511,8 @@ SendGroupKeys_Simulated(keysArray) {
 }
 
 SendGroupKeys_Posted(keysArray) {
-    Global Toggle, TotalProcesses, TargetHwndArray, KeyDelay
+    Global Toggle, SendGroup_ExecHwnds, SendGroup_ExecN, KeyDelay
+    Global SendGroup_MouseFixed, SendGroup_MouseCX, SendGroup_MouseCY, SendGroup_MouseNoMove
     Loop % keysArray.Length()
     {
         If (!Toggle)
@@ -1119,33 +1523,33 @@ SendGroupKeys_Posted(keysArray) {
                 Return
             holdMs := hm1 + 0
             keyspec := hm2
-            Global HeldInfinite, TotalProcesses, TargetHwndArray, KeyDelay
-            Loop %TotalProcesses% {
-                hW := TargetHwndArray[A_Index]
+            Global HeldInfinite, KeyDelay
+            Loop %SendGroup_ExecN% {
+                hW := SendGroup_ExecHwnds[A_Index]
                 SendKeyspec_PostDown(hW, keyspec)
             }
             if (holdMs > 0) {
                 Sleep, %holdMs%
                 if (!Toggle) {
-                    Loop %TotalProcesses% {
-                        SendKeyspec_PostUp(TargetHwndArray[A_Index], keyspec)
+                    Loop %SendGroup_ExecN% {
+                        SendKeyspec_PostUp(SendGroup_ExecHwnds[A_Index], keyspec)
                     }
                     Return
                 }
-                Loop %TotalProcesses% {
-                    SendKeyspec_PostUp(TargetHwndArray[A_Index], keyspec)
+                Loop %SendGroup_ExecN% {
+                    SendKeyspec_PostUp(SendGroup_ExecHwnds[A_Index], keyspec)
                 }
             } else {
-                HeldInfinite.Push({s: 0, k: keyspec})
+                HeldInfinite.Push({s: 0, k: keyspec, h: SnapshotExecHwnds(), mouseFixed: SendGroup_MouseFixed, mouseCX: SendGroup_MouseCX, mouseCY: SendGroup_MouseCY, mouseNoMove: SendGroup_MouseNoMove})
             }
             Sleep, %KeyDelay%
             Continue
         }
         If (RegExMatch(currentKey, "i)^\{(LButton|LClick|Click)\}$"))
         {
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 SendLeftClickAtCursor(hWndTarget, False)
             }
             Sleep, %KeyDelay%
@@ -1153,9 +1557,9 @@ SendGroupKeys_Posted(keysArray) {
         }
         If (RegExMatch(currentKey, "i)^\{(RButton|RClick)\}$"))
         {
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 SendRightClickAtCursor(hWndTarget, False)
             }
             Sleep, %KeyDelay%
@@ -1163,9 +1567,9 @@ SendGroupKeys_Posted(keysArray) {
         }
         If (RegExMatch(currentKey, "i)^\{Space\}$"))
         {
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 PostTapVkFocused(hWndTarget, 0x20)
             }
             Sleep, %KeyDelay%
@@ -1191,9 +1595,9 @@ SendGroupKeys_Posted(keysArray) {
                 VarSetCapacity(char, 4, 0)
                 StrPut(mainKey, &char, "UTF-16")
                 charCode := NumGet(char, 0, "UShort")
-                Loop %TotalProcesses%
+                Loop %SendGroup_ExecN%
                 {
-                    hWndTarget := TargetHwndArray[A_Index]
+                    hWndTarget := SendGroup_ExecHwnds[A_Index]
                     PostMsgModsDownFromString(hWndTarget, modifiers)
                     PostMsgToFocus(hWndTarget, 0x0102, charCode, 1)
                     PostMsgModsUpFromString(hWndTarget, modifiers)
@@ -1221,9 +1625,9 @@ SendGroupKeys_Posted(keysArray) {
                     vkMain := GetKeyVK(mainKey)
                     If vkMain
                     {
-                        Loop %TotalProcesses%
+                        Loop %SendGroup_ExecN%
                         {
-                            hWndTarget := TargetHwndArray[A_Index]
+                            hWndTarget := SendGroup_ExecHwnds[A_Index]
                             PostMsgModsDownFromList(hWndTarget, modifiers)
                             PostMsgToFocus(hWndTarget, 0x100, vkMain, PostMsgKeyLP(vkMain, 0, hWndTarget))
                             PostMsgToFocus(hWndTarget, 0x101, vkMain, PostMsgKeyLP(vkMain, 1, hWndTarget))
@@ -1237,9 +1641,9 @@ SendGroupKeys_Posted(keysArray) {
         Else If (StrLen(keyStr) = 1 && keyStr != " ")
         {
             ch0 := Ord(keyStr)
-            Loop %TotalProcesses%
+            Loop %SendGroup_ExecN%
             {
-                hWndTarget := TargetHwndArray[A_Index]
+                hWndTarget := SendGroup_ExecHwnds[A_Index]
                 if (ch0 >= 0x30 && ch0 <= 0x39) {
                     PostTapVkFocused(hWndTarget, ch0)
                 } else {
@@ -1274,9 +1678,9 @@ SendGroupKeys_Posted(keysArray) {
             vk := GetKeyVK(keyStr)
             If vk
             {
-                Loop %TotalProcesses%
+                Loop %SendGroup_ExecN%
                 {
-                    hWndTarget := TargetHwndArray[A_Index]
+                    hWndTarget := SendGroup_ExecHwnds[A_Index]
                     PostTapVkFocused(hWndTarget, vk)
                 }
             }
@@ -1332,32 +1736,97 @@ ParseKeys(keysString) {
     Return keysArray
 }
 
-CursorOverTargetHwnd(hTop) {
-    if (!hTop)
-        return 0
-    MouseGetPos, , , hUnder
-    hUnder += 0
-    if (!hUnder)
-        return 0
-    rT := KeyTargetGameRoot(hTop)
-    rU := KeyTargetGameRoot(hUnder)
-    return (rT && rU && rT = rU)
+GroupKeysNeedMouse(keys) {
+    if (keys = "")
+        return false
+    return RegExMatch(keys, "i)\{(LButton|RButton|MButton|LClick|RClick|Click)\}")
+}
+
+MapClientPointBetweenHwnds(cxFrom, cyFrom, hWndFrom, hWndTo, ByRef outX, ByRef outY) {
+    outX := cxFrom + 0, outY := cyFrom + 0
+    if (!hWndFrom || !hWndTo)
+        return
+    VarSetCapacity(pt, 8, 0)
+    NumPut(cxFrom + 0, pt, 0, "Int")
+    NumPut(cyFrom + 0, pt, 4, "Int")
+    if (!DllCall("user32\ClientToScreen", "Ptr", hWndFrom, "Ptr", &pt))
+        return
+    if (!DllCall("user32\ScreenToClient", "Ptr", hWndTo, "Ptr", &pt))
+        return
+    outX := NumGet(pt, 0, "Int")
+    outY := NumGet(pt, 4, "Int")
+}
+
+PostWmMouseMoveCursorToRootClient(hWndTarget, clientX, clientY) {
+    root := KeyTargetGameRoot(hWndTarget)
+    if (!root)
+        return
+    VarSetCapacity(scPt, 8, 0)
+    NumPut(clientX + 0, scPt, 0, "Int")
+    NumPut(clientY + 0, scPt, 4, "Int")
+    if (!DllCall("user32\ClientToScreen", "Ptr", root, "Ptr", &scPt))
+        return
+    sx := NumGet(scPt, 0, "Int")
+    sy := NumGet(scPt, 4, "Int")
+    DllCall("user32\SetCursorPos", "Int", sx, "Int", sy)
+    PostWmMouseAfterCursorMove()
+}
+
+PostWmMouseAfterCursorMove() {
+    Global KeyDelay
+    kd := KeyDelay + 0
+    settle := kd + 3
+    if (settle < 3)
+        settle := 3
+    if (settle > 50)
+        settle := 50
+    Sleep, %settle%
+}
+
+PostWmMouseSnapBegin(hWndTarget, clientX, clientY) {
+    Global SendGroup_MouseNoMove, MousePostSnapLock, MousePostSnapOx, MousePostSnapOy, MousePostSnapHaveSave
+    if (SendGroup_MouseNoMove) {
+        MousePostSnapLock++
+        PostWmMouseAfterCursorMove()
+        return
+    }
+    if (!MousePostSnapHaveSave) {
+        VarSetCapacity(pt, 8, 0)
+        if (DllCall("user32\GetCursorPos", "Ptr", &pt)) {
+            MousePostSnapOx := NumGet(pt, 0, "Int")
+            MousePostSnapOy := NumGet(pt, 4, "Int")
+            MousePostSnapHaveSave := true
+        }
+    }
+    MousePostSnapLock++
+    PostWmMouseMoveCursorToRootClient(hWndTarget, clientX, clientY)
+}
+
+PostWmMouseSnapEnd() {
+    Global MousePostSnapLock, MousePostSnapOx, MousePostSnapOy, MousePostSnapHaveSave
+    if (MousePostSnapLock < 1)
+        return
+    MousePostSnapLock--
+    if (MousePostSnapLock = 0 && MousePostSnapHaveSave) {
+        DllCall("user32\SetCursorPos", "Int", MousePostSnapOx, "Int", MousePostSnapOy)
+        MousePostSnapHaveSave := false
+    }
+}
+
+PostWmMouseSnapResetIfAny() {
+    Global MousePostSnapLock, MousePostSnapOx, MousePostSnapOy, MousePostSnapHaveSave
+    if (MousePostSnapLock < 1)
+        return
+    if (MousePostSnapHaveSave)
+        DllCall("user32\SetCursorPos", "Int", MousePostSnapOx, "Int", MousePostSnapOy)
+    MousePostSnapLock := 0
+    MousePostSnapHaveSave := false
 }
 
 ResolveClickClientCoords(hWnd, ByRef cX, ByRef cY) {
     cX := 0, cY := 0
     if (!hWnd)
         return
-    if (CursorOverTargetHwnd(hWnd)) {
-        MouseGetPos, sX, sY
-        VarSetCapacity(pt, 8, 0)
-        NumPut(sX, pt, 0, "Int")
-        NumPut(sY, pt, 4, "Int")
-        DllCall("user32\ScreenToClient", "Ptr", hWnd, "Ptr", &pt)
-        cX := NumGet(pt, 0, "Int")
-        cY := NumGet(pt, 4, "Int")
-        return
-    }
     VarSetCapacity(rc, 16, 0)
     if (!DllCall("user32\GetClientRect", "Ptr", hWnd, "Ptr", &rc))
         return
@@ -1384,32 +1853,89 @@ ResolveClickClientCoords(hWnd, ByRef cX, ByRef cY) {
     cY := Floor(ch / 2)
 }
 
+ResolveGroupClickClientCoords(hWndTarget, forControlClick, ByRef cX, ByRef cY) {
+    Global SendGroup_MouseFixed, SendGroup_MouseCX, SendGroup_MouseCY, SendGroup_ExecHwnds
+    if (SendGroup_MouseFixed && SendGroup_MouseCX != "" && SendGroup_MouseCY != "") {
+        r1 := SendGroup_ExecHwnds.Length() >= 1 ? KeyTargetGameRoot(SendGroup_ExecHwnds[1]) : KeyTargetGameRoot(hWndTarget)
+        if (forControlClick) {
+            MapClientPointBetweenHwnds(SendGroup_MouseCX + 0, SendGroup_MouseCY + 0, r1, hWndTarget, cX, cY)
+        } else {
+            rT := KeyTargetGameRoot(hWndTarget)
+            if (r1 && rT)
+                MapClientPointBetweenHwnds(SendGroup_MouseCX + 0, SendGroup_MouseCY + 0, r1, rT, cX, cY)
+            else {
+                cX := SendGroup_MouseCX + 0
+                cY := SendGroup_MouseCY + 0
+            }
+        }
+    } else {
+        ResolveClickClientCoords(hWndTarget, cX, cY)
+        if (!forControlClick) {
+            rT := KeyTargetGameRoot(hWndTarget)
+            if (rT && (hWndTarget + 0) != (rT + 0))
+                MapClientPointBetweenHwnds(cX + 0, cY + 0, hWndTarget, rT, cX, cY)
+        }
+    }
+}
+
 SendLeftClickAtCursor(hWndTarget, useSimulation := False) {
     if (!hWndTarget)
         return
-    ResolveClickClientCoords(hWndTarget, cX, cY)
+    Global SendGroup_MouseNoMove
+    ResolveGroupClickClientCoords(hWndTarget, useSimulation, cX, cY)
     if (useSimulation) {
         ControlClick, x%cX% y%cY%, ahk_id %hWndTarget%,, Left, 1, NA
         return
     }
+    if (SendGroup_MouseNoMove) {
+        PostWmMouseAfterCursorMove()
+        lParam := ((cY & 0xFFFF) << 16) | (cX & 0xFFFF)
+        SendMsgToFocus(hWndTarget, 0x200, 0, lParam)
+        SendMsgToFocus(hWndTarget, 0x201, 1, lParam)
+        SendMsgToFocus(hWndTarget, 0x202, 0, lParam)
+        Sleep, 0
+        return
+    }
+    VarSetCapacity(savePt, 8, 0)
+    DllCall("user32\GetCursorPos", "Ptr", &savePt)
+    ox := NumGet(savePt, 0, "Int"), oy := NumGet(savePt, 4, "Int")
+    PostWmMouseMoveCursorToRootClient(hWndTarget, cX, cY)
     lParam := ((cY & 0xFFFF) << 16) | (cX & 0xFFFF)
-    PostMsgToFocus(hWndTarget, 0x200, 0, lParam)
-    PostMsgToFocus(hWndTarget, 0x201, 1, lParam)
-    PostMsgToFocus(hWndTarget, 0x202, 0, lParam)
+    SendMsgToFocus(hWndTarget, 0x200, 0, lParam)
+    SendMsgToFocus(hWndTarget, 0x201, 1, lParam)
+    SendMsgToFocus(hWndTarget, 0x202, 0, lParam)
+    Sleep, 0
+    DllCall("user32\SetCursorPos", "Int", ox, "Int", oy)
 }
 
 SendRightClickAtCursor(hWndTarget, useSimulation := False) {
     if (!hWndTarget)
         return
-    ResolveClickClientCoords(hWndTarget, cX, cY)
+    Global SendGroup_MouseNoMove
+    ResolveGroupClickClientCoords(hWndTarget, useSimulation, cX, cY)
     if (useSimulation) {
         ControlClick, x%cX% y%cY%, ahk_id %hWndTarget%,, Right, 1, NA
         return
     }
+    if (SendGroup_MouseNoMove) {
+        PostWmMouseAfterCursorMove()
+        lParam := ((cY & 0xFFFF) << 16) | (cX & 0xFFFF)
+        SendMsgToFocus(hWndTarget, 0x200, 0, lParam)
+        SendMsgToFocus(hWndTarget, 0x204, 2, lParam)
+        SendMsgToFocus(hWndTarget, 0x205, 0, lParam)
+        Sleep, 0
+        return
+    }
+    VarSetCapacity(savePt, 8, 0)
+    DllCall("user32\GetCursorPos", "Ptr", &savePt)
+    ox := NumGet(savePt, 0, "Int"), oy := NumGet(savePt, 4, "Int")
+    PostWmMouseMoveCursorToRootClient(hWndTarget, cX, cY)
     lParam := ((cY & 0xFFFF) << 16) | (cX & 0xFFFF)
-    PostMsgToFocus(hWndTarget, 0x200, 0, lParam)
-    PostMsgToFocus(hWndTarget, 0x204, 2, lParam)
-    PostMsgToFocus(hWndTarget, 0x205, 0, lParam)
+    SendMsgToFocus(hWndTarget, 0x200, 0, lParam)
+    SendMsgToFocus(hWndTarget, 0x204, 2, lParam)
+    SendMsgToFocus(hWndTarget, 0x205, 0, lParam)
+    Sleep, 0
+    DllCall("user32\SetCursorPos", "Int", ox, "Int", oy)
 }
 
 ; === Получение VK-кода ===
@@ -1466,7 +1992,9 @@ PostMsgKeyLP(vk, keyUp, hWndTop) {
 DeliverActivateRootSync(root) {
     if (!root)
         return 0
-    return DllCall("user32\SendMessageW", "Ptr", root, "UInt", 0x0006, "Ptr", 1, "Ptr", 0, "Int")
+    ; Не блокируем поток скрипта синхронным SendMessage:
+    ; при зависшем целевом окне это "замораживает" хоткеи/трей/ExitApp.
+    return DllCall("user32\PostMessageW", "Ptr", root, "UInt", 0x0006, "Ptr", 1, "Ptr", 0, "Int")
 }
 
 PostMsgToFocus(hWndTop, msg, wParam, lParam) {
@@ -1475,7 +2003,17 @@ PostMsgToFocus(hWndTop, msg, wParam, lParam) {
     root := KeyTargetGameRoot(hWndTop)
     if (!root)
         return 0
-    DeliverActivateRootSync(root)
+    return DllCall("user32\PostMessageW", "Ptr", root, "UInt", msg, "Ptr", wParam, "Ptr", lParam, "Int")
+}
+
+SendMsgToFocus(hWndTop, msg, wParam, lParam) {
+    if (!hWndTop)
+        return 0
+    root := KeyTargetGameRoot(hWndTop)
+    if (!root)
+        return 0
+    ; Историческое имя функции сохранено, но отправка теперь асинхронная:
+    ; это предотвращает блокировку всего скрипта при зависшем target window.
     return DllCall("user32\PostMessageW", "Ptr", root, "UInt", msg, "Ptr", wParam, "Ptr", lParam, "Int")
 }
 
@@ -1497,6 +2035,7 @@ ChooseMouseHoldDetectTimer:
     Global KeysArray, IsChoosingKeys, ChoosePendingMouseBtn, ChoosePendingMouseToken, ChooseHoldWaitUpMouse, DefaultInterval
     if (!IsChoosingKeys || !ChoosePendingMouseBtn)
         return
+    Gui, KeyPick:Default
     GuiControlGet, hm,, GroupInterval
     if (hm = "")
         holdMs := DefaultInterval
@@ -1506,7 +2045,7 @@ ChooseMouseHoldDetectTimer:
         holdMs := 0
     keyspec := TokenToHoldKeyspec(ChoosePendingMouseToken)
     KeysArray .= (KeysArray ? " " : "") . "{HOLD" . holdMs . "|" . keyspec . "}"
-    GuiControl,, KeyList, %KeysArray%
+    KeyPickRefreshList()
     ChooseHoldWaitUpMouse := ChoosePendingMouseBtn
     ChoosePendingMouseBtn := 0, ChoosePendingMouseToken := "", ChoosePendingMouseStart := 0
     SetTimer, ChooseMouseHoldDetectTimer, Off
@@ -1516,6 +2055,7 @@ ChooseHoldDetectTimer:
     Global KeysArray, IsChoosingKeys, ChoosePendingVk, ChoosePendingToken, ChooseHoldWaitUpVk, DefaultInterval
     if (!IsChoosingKeys || !ChoosePendingVk)
         return
+    Gui, KeyPick:Default
     GuiControlGet, hm,, GroupInterval
     if (hm = "")
         holdMs := DefaultInterval
@@ -1525,16 +2065,19 @@ ChooseHoldDetectTimer:
         holdMs := 0
     keyspec := TokenToHoldKeyspec(ChoosePendingToken)
     KeysArray .= (KeysArray ? " " : "") . "{HOLD" . holdMs . "|" . keyspec . "}"
-    GuiControl,, KeyList, %KeysArray%
+    KeyPickRefreshList()
     ChooseHoldWaitUpVk := ChoosePendingVk
     ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
     SetTimer, ChooseHoldDetectTimer, Off
 return
 
 KeyDownMsg(wParam, lParam) {
-    Global KeysArray, IsChoosingKeys, ChoosePendingVk, ChoosePendingToken, ChoosePendingStart, ChooseHoldWaitUpVk
-    If (!IsChoosingKeys)
+    Global KeysArray, IsChoosingKeys, ChoosePendingVk, ChoosePendingToken, ChoosePendingStart, ChooseHoldWaitUpVk, KeyPickHwnd
+    If (!IsChoosingKeys || !KeyPickHwnd)
         Return
+    if (!WinActive("ahk_id " . KeyPickHwnd))
+        Return
+    Gui, KeyPick:Default
     ControlGetFocus, FocusedControl
     If (FocusedControl = "Edit2")
         Return
@@ -1592,7 +2135,7 @@ KeyDownMsg(wParam, lParam) {
     if (ChoosePendingVk && ChoosePendingVk != vk) {
         SetTimer, ChooseHoldDetectTimer, Off
         KeysArray .= (KeysArray ? " " : "") . ChoosePendingToken
-        GuiControl,, KeyList, %KeysArray%
+        KeyPickRefreshList()
         ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
     }
     if (ChoosePendingVk = vk)
@@ -1605,9 +2148,10 @@ KeyDownMsg(wParam, lParam) {
 }
 
 KeyUpMsg(wParam, lParam) {
-    Global KeysArray, IsChoosingKeys, ChoosePendingVk, ChoosePendingToken, ChoosePendingStart, ChooseHoldWaitUpVk, DefaultInterval
-    If (!IsChoosingKeys)
+    Global KeysArray, IsChoosingKeys, ChoosePendingVk, ChoosePendingToken, ChoosePendingStart, ChooseHoldWaitUpVk, DefaultInterval, KeyPickHwnd
+    If (!IsChoosingKeys || !KeyPickHwnd)
         Return
+    Gui, KeyPick:Default
     ControlGetFocus, FocusedControl
     If (FocusedControl = "Edit2")
         Return
@@ -1635,11 +2179,14 @@ KeyUpMsg(wParam, lParam) {
     else
         KeysArray .= (KeysArray ? " " : "") . "{HOLD" . holdMs . "|" . keyspec . "}"
     ChoosePendingVk := 0, ChoosePendingToken := "", ChoosePendingStart := 0
-    GuiControl,, KeyList, %KeysArray%
+    KeyPickRefreshList()
 }
 
 ; === Подпрограмма выхода ===
-ExitApp:
-    ReleaseAllHeldInfinite()
+MboxDoExit:
     ExitApp
 Return
+
+MboxOnExitCleanup:
+    ReleaseAllHeldInfinite()
+    return
